@@ -7,7 +7,7 @@ upstream. Upstream: `project-zot/zot`. Branch rules and commit policy: see `CLAU
 
 | # | Task | Branch | Status |
 | --- | --- | --- | --- |
-| 1 | Upstream issue: bcrypt cost makes tests slow | `fix/test-bcrypt-cost` (`f77e51aa`) | fix done; upstream CI proof collected; measure `pkg/api` before/after (next), draft issue |
+| 1 | Upstream issue: bcrypt cost makes tests slow | `fix/test-bcrypt-cost` (`f77e51aa`) | fix done; upstream CI proof and `pkg/api` before/after collected; draft issue (next) |
 | 2 | Confirm the bcrypt fix in staging CI | `staging` | not started: rebuild staging with it |
 | 3 | bbolt deadlock in the CVE scan task generator | `fix/boltdb-nested-tx-deadlock` (`02313f7f`) | documented in its `ISSUES.md`; fix and regression test not written; not reported upstream |
 | 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`484d3645`) | done and tested; upstream PR not opened |
@@ -97,12 +97,32 @@ on `main`, job "Run zot with extensions tests". It runs
   (`mgmt`), `mtls_test.go` 3, `routes_test.go` 1. Loops that hash several credential strings:
   `controller_test.go:922-929`, `:979`, `:7856`.
 
-**Still to do:**
+**`pkg/api` before/after (measured 2026-09-29):** whole package, `go test -json -race -trimpath
+-timeout 60m` with tags `events,imagetrust,lint,metrics,mgmt,profile,scrub,search,sync,ui,userprefs`
+(no coverage), run as a non-root user on a 4-CPU cloud sandbox. Before = upstream `main` @
+`4f79e998`, after = `fix/test-bcrypt-cost` (`f77e51aa`, only `pkg/test/common/fs.go` differs).
+All 284 top-level tests ran in both.
 
-1. Measure the whole `pkg/api` package before/after `MinCost` (cloud session, ~20+ min per run):
-   `env GOEXPERIMENT=jsonv2 go test -tags events,imagetrust,lint,metrics,mgmt,profile,scrub,search,sync,ui,userprefs -trimpath -race -timeout 60m ./pkg/api/`
-   with `-json` for per-test times, on `main` and on `fix/test-bcrypt-cost`. Record here.
-2. Draft the issue: problem, cause, upstream CI numbers above, local before/after, one-line fix.
+| | before (cost 10) | after (`MinCost`) |
+| --- | --- | --- |
+| package | 1218 s (over the 1200 s CI timeout) | 465 s (-62%) |
+| `TestAuthorizationForTagUpdate` | 164.2 s | 6.6 s |
+| `TestAuthorization` | 50.7 s | 1.9 s |
+| `TestPagedRepositoriesWithAuthorization` | 50.1 s | 1.8 s |
+| `TestScaleOutRequestProxy` | 46.2 s | 7.7 s |
+| `TestRoutes` | 42.4 s | 6.9 s |
+| `TestSearchRoutes` | 41.8 s | 2.2 s |
+| `TestHTPasswdWatcher` | 34.3 s | 3.3 s |
+| `TestOpenIDMiddleware` | 26.1 s | 5.4 s |
+
+Unchanged (no htpasswd): `TestBasicAuthWithReloadedCredentials` 114.9 s, `TestInterruptedBlobUpload`
+~62 s, `TestLDAPClient` / `TestLDAPWithoutCreds` 28 s. `TestRedisCookieStore` failed in both runs:
+it expects the GitHub runner's resolver text (`127.0.0.53`), the sandbox uses `8.8.8.8`; unrelated.
+Setup notes for re-running: a `tester` user with its own module/build cache and worktrees under
+`/home/tester/bench` (root breaks the permission-based tests; `TestCookiestoreCleanup` panics).
+
+**Still to do:** draft the issue: problem, cause, upstream CI numbers above, local before/after
+(`pkg/api` and `pkg/extensions/search`), one-line fix.
 
 ## Task 3: deadlock notes
 
