@@ -22,10 +22,13 @@
 | --- | --- | --- |
 | `main` | matches upstream | fast-forward only |
 | `develop` | `main` + personal baseline (this file, etc.), never goes upstream | merge `main` in |
-| `feat/<name>` | `develop` + one feature | normal commits |
-| `fix/<name>` | `develop` + a change to the personal baseline | merged back into `develop` |
-| `pr/<name>` | `main` + one feature, for the upstream PR | rebuilt for each PR |
-| `staging` | `develop` + all pending `feat/*` | rebuilt, force-pushed |
+| `feat/<name>` | `develop` + one feature, for upstream | normal commits |
+| `fix/<name>` | `develop` + one bug fix, for upstream | normal commits |
+| `base/<name>` | `develop` + a change to the personal baseline, never goes upstream | merged back into `develop` |
+| `pr/<name>` | `main` + one `feat/` or `fix/` branch, for the upstream PR | rebuilt for each PR |
+| `staging` | `develop` + all pending `feat/*` and `fix/*` | rebuilt, force-pushed |
+
+`feat/` and `fix/` branches are handled the same way; below, `<type>` is `feat` or `fix`.
 
 **Before working:**
 
@@ -34,32 +37,32 @@ git fetch origin main develop
 git checkout develop
 git merge origin/main            # merge, never rebase develop
 git push origin develop
-git checkout -b feat/<name>
+git checkout -b <type>/<name>    # base/<name> for a baseline change
 ```
 
-**When completed, before creating a PR:** build a `pr/<name>` branch with only the feature
+**When completed, before creating a PR:** build a `pr/<name>` branch with only the `<type>/<name>`
 commits on top of `main`, excluding the develop-only commits:
 
 ```bash
 git fetch origin main
-git checkout -b pr/<name> feat/<name>
+git checkout -b pr/<name> <type>/<name>
 git rebase --onto origin/main develop pr/<name>
 git diff --stat origin/main pr/<name>   # must not include CLAUDE.md or other develop-only files
 git push -u origin pr/<name>
 ```
 
-**Staging:** `staging` consolidates all pending features. Rules:
+**Staging:** `staging` consolidates all pending `feat/` and `fix/` branches. Rules:
 
-- Base it on `develop`, and merge only `feat/*` branches into it, never `pr/*`.
-- Never branch from `staging`: new `feat/` branches start from `develop`.
-- Rebuild it instead of accumulating history, whenever a feature is added, merged upstream,
-  dropped, or its `feat/` branch is rebased.
-- Resolve conflicts between features while merging into `staging`, not in the `feat/` branches.
+- Base it on `develop`, and merge only `feat/*` and `fix/*` branches into it, never `pr/*` or `base/*`.
+- Never branch from `staging`: new branches start from `develop`.
+- Rebuild it instead of accumulating history, whenever a branch is added, merged upstream,
+  dropped, or rebased.
+- Resolve conflicts between branches while merging into `staging`, not in the branches themselves.
 
 ```bash
 git fetch origin
 git checkout -B staging origin/develop
-for b in origin/feat/<a> origin/feat/<b>; do   # every pending feat/ branch, one at a time
+for b in origin/feat/<a> origin/fix/<b>; do    # every pending feat/ and fix/ branch, one at a time
   git merge --no-ff "$b"                        # resolve conflicts here, then continue
 done
 git push --force-with-lease origin staging
