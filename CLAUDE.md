@@ -23,6 +23,7 @@
 | `main` | matches upstream | fast-forward only |
 | `develop` | `main` + personal baseline (this file, etc.), never goes upstream | merge `main` in |
 | `feat/<name>` | `develop` + one feature | normal commits |
+| `fix/<name>` | `develop` + a change to the personal baseline | merged back into `develop` |
 | `pr/<name>` | `main` + one feature, for the upstream PR | rebuilt for each PR |
 | `staging` | `develop` + all pending `feat/*` | rebuilt, force-pushed |
 
