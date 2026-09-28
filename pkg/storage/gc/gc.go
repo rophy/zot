@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/distribution/distribution/v3/registry/storage/driver"
@@ -84,7 +85,9 @@ func NewGarbageCollect(imgStore types.ImageStore, metaDB mTypes.MetaDB, opts Opt
 CleanImageStorePeriodically runs a periodic garbage collect on the ImageStore provided in constructor,
 given an interval and a Scheduler.
 */
-func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch *scheduler.Scheduler) {
+// CleanImageStorePeriodically submits a periodic GC sweep of the image store to the scheduler,
+// and returns an OnDemand for running GC before the next periodic sweep is due.
+func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch *scheduler.Scheduler) *OnDemand {
 	processedRepos := make(map[string]struct{})
 
 	maxDelay := gc.opts.MaxSchedulerDelay
@@ -98,9 +101,12 @@ func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch
 		processedRepos: processedRepos,
 		maxDelay:       maxDelay,
 		timeWindow:     gc.opts.TimeWindow,
+		sweep:          &sweepState{},
 	}
 
 	sch.SubmitGenerator(generator, interval, scheduler.MediumPriority)
+
+	return newOnDemand(gc, sch, generator)
 }
 
 /*
@@ -110,12 +116,17 @@ It also gc referrers with missing subject if the Referrer Option is enabled
 It also gc untagged manifests.
 */
 func (gc GarbageCollect) CleanRepo(ctx context.Context, repo string) error {
+	return gc.runCleanRepo(ctx, repo, nil)
+}
+
+// runCleanRepo runs CleanRepo and, if deleted is not nil, reports what was deleted.
+func (gc GarbageCollect) runCleanRepo(ctx context.Context, repo string, deleted *DeletedCounts) error {
 	gc.log.Info().Str("module", "gc").
 		Msg("executing gc of orphaned blobs for " + path.Join(gc.imgStore.RootDir(), repo))
 
 	start := time.Now()
 
-	if err := gc.cleanRepo(ctx, repo); err != nil {
+	if err := gc.cleanRepoWithCounts(ctx, repo, deleted); err != nil {
 		monitoring.ObserveGCDuration(gc.metrics, time.Since(start))
 		monitoring.IncGCRuns(gc.metrics, true)
 
@@ -137,6 +148,10 @@ func (gc GarbageCollect) CleanRepo(ctx context.Context, repo string) error {
 }
 
 func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
+	return gc.cleanRepoWithCounts(ctx, repo, nil)
+}
+
+func (gc GarbageCollect) cleanRepoWithCounts(ctx context.Context, repo string, deleted *DeletedCounts) error {
 	var lockLatency time.Time
 
 	dir := path.Join(gc.imgStore.RootDir(), repo)
@@ -256,6 +271,10 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 		monitoring.IncGCDeleted(gc.metrics, "manifest", manifestsDeleted)
 		monitoring.IncGCDeleted(gc.metrics, "blob", blobsDeleted)
 		monitoring.IncGCDeleted(gc.metrics, "upload", uploadsDeleted)
+
+		if deleted != nil {
+			*deleted = DeletedCounts{Manifests: manifestsDeleted, Blobs: blobsDeleted, Uploads: uploadsDeleted}
+		}
 	}
 
 	return nil
@@ -1198,6 +1217,10 @@ type GCTaskGenerator struct {
 	maxDelay          time.Duration
 	timeWindow        config.GCTimeWindow
 	loggedWindowDefer bool
+	// sweep tracks the status of the current or last sweep.
+	sweep *sweepState
+	// forceSweep lets the next sweep start outside the time window, when requested on demand.
+	forceSweep atomic.Bool
 }
 
 func (gen *GCTaskGenerator) getRandomDelay() time.Duration {
@@ -1230,15 +1253,28 @@ func (gen *GCTaskGenerator) Next() (scheduler.Task, error) {
 		return nil, err
 	}
 
+	if len(gen.processedRepos) == 0 {
+		gen.forceSweep.Store(false)
+		gen.sweep.start()
+	}
+
 	if repo == "" {
 		gen.done = true
+		// a request which raced with this sweep's start is covered by this sweep
+		gen.forceSweep.Store(false)
+		gen.sweep.generationDone()
 
 		return nil, nil //nolint:nilnil
 	}
 
 	gen.processedRepos[repo] = struct{}{}
 
-	return NewGCTask(gen.imgStore, gen.gc, repo), nil
+	gen.sweep.taskStarted()
+
+	task := NewGCTask(gen.imgStore, gen.gc, repo)
+	task.onDone = gen.sweep.taskDone
+
+	return task, nil
 }
 
 func (gen *GCTaskGenerator) IsDone() bool {
@@ -1258,7 +1294,7 @@ func (gen *GCTaskGenerator) IsReady() bool {
 	// window reopens the next day.
 	startingNewSweep := len(gen.processedRepos) == 0 && gen.nextRun.IsZero()
 
-	if startingNewSweep && !gen.timeWindow.Contains(now) {
+	if startingNewSweep && !gen.forceSweep.Load() && !gen.timeWindow.Contains(now) {
 		if !gen.loggedWindowDefer {
 			if gen.gc.log.Logger != nil {
 				gen.gc.log.Debug().Msg("gc sweep deferred, outside gcTimeWindow")
@@ -1285,16 +1321,26 @@ type gcTask struct {
 	imgStore types.ImageStore
 	gc       GarbageCollect
 	repo     string
+	// onDone, if set, is called with what was deleted and the result once the task has run.
+	onDone func(deleted DeletedCounts, err error)
 }
 
 func NewGCTask(imgStore types.ImageStore, gc GarbageCollect, repo string,
 ) *gcTask {
-	return &gcTask{imgStore, gc, repo}
+	return &gcTask{imgStore: imgStore, gc: gc, repo: repo}
 }
 
 func (gct *gcTask) DoWork(ctx context.Context) error {
+	var deleted DeletedCounts
+
 	// run task
-	return gct.gc.CleanRepo(ctx, gct.repo) //nolint: contextcheck
+	err := gct.gc.runCleanRepo(ctx, gct.repo, &deleted) //nolint: contextcheck
+
+	if gct.onDone != nil {
+		gct.onDone(deleted, err)
+	}
+
+	return err
 }
 
 func (gct *gcTask) String() string {
