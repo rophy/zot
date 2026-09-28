@@ -52,6 +52,7 @@ Starts garbage collection of a store, or of a single repository in it, before th
 It uses the store's own GC settings (`gcDelay`, retention policies). Only admins can use it.
 
 The `store` parameter is `/` for the default store, otherwise a `subPaths` key. GC must be enabled for the store.
+Like the rest of `mgmt`, this endpoint is only available when the `search` extension is enabled.
 
 - Without `repo`, the whole store is swept by the same task generator as the periodic sweep, so it is paced
   the same way: repositories are collected one after another with a random delay of up to 30 seconds between them.

@@ -531,8 +531,12 @@ func (gen *generator) getRanking() float64 {
 
 // RunGeneratorNow makes a periodic generator which is waiting for its interval to pass
 // ready to run again, without changing its interval. A generator which is already running is left as is.
-// It returns false if the generator was not submitted to this scheduler.
+// It returns false if the generator was not submitted to this scheduler, or the scheduler is shutting down.
 func (scheduler *Scheduler) RunGeneratorNow(taskGenerator TaskGenerator) bool {
+	if scheduler.inShutdown() {
+		return false
+	}
+
 	scheduler.generatorsLock.Lock()
 	defer scheduler.generatorsLock.Unlock()
 

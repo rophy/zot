@@ -173,6 +173,16 @@ func TestGarbageCollectOnDemand(t *testing.T) {
 			_, found := onDemand.RepoStatus(onDemandRepo)
 			So(found, ShouldBeFalse)
 		})
+
+		Convey("SweepNow reports a sweep the scheduler will not run", func() {
+			onDemand := gc.NewGarbageCollect(imgStore, metaDB, opts, nil, log, metrics).
+				CleanImageStorePeriodically(time.Hour, sch)
+
+			sch.RunScheduler()
+			sch.Shutdown()
+
+			So(onDemand.SweepNow(), ShouldEqual, zerr.ErrGCNotScheduled)
+		})
 	})
 }
 

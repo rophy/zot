@@ -536,6 +536,18 @@ func TestRunGeneratorNow(t *testing.T) {
 
 		So(sch.RunGeneratorNow(&onceGenerator{runs: &atomic.Int64{}}), ShouldBeFalse)
 	})
+
+	Convey("A generator is not run once the scheduler is shutting down", t, func() {
+		sch := scheduler.NewScheduler(config.New(), monitoring.NewNopMetricServer(), log.NewTestLogger())
+
+		gen := &onceGenerator{runs: &atomic.Int64{}}
+		sch.SubmitGenerator(gen, time.Hour, scheduler.MediumPriority)
+
+		sch.RunScheduler()
+		sch.Shutdown()
+
+		So(sch.RunGeneratorNow(gen), ShouldBeFalse)
+	})
 }
 
 func waitFor(cond func() bool, timeout time.Duration) bool {
