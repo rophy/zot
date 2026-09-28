@@ -64,6 +64,10 @@ done
 git push --force-with-lease origin staging
 ```
 
+Pushing `staging` runs `.github/workflows/staging.yaml`: the unit tests (`make test-minimal`,
+`make test-extended`), then the full image for linux/amd64 and linux/arm64, pushed as
+`ghcr.io/rophy/zot:staging-<short-sha>`. Upstream's own workflows are disabled in this fork.
+
 ## Commit Author and Sign-off
 
 Author every commit as the user, and sign it off (DCO) with `-s`:

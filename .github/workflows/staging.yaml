@@ -1,0 +1,94 @@
+name: Staging build
+
+# Builds the staging branch (develop + all pending feat/ branches) into
+# ghcr.io/<owner>/zot:staging-<short-sha>, after the unit tests pass.
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+permissions: read-all
+
+# staging is rebuilt and force-pushed, so only its latest push matters
+concurrency:
+  group: staging
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        suite: [minimal, extended]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          cache: false
+          check-latest: true
+          go-version-file: .go-version
+      - name: Cache go dependencies
+        id: cache-go-dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mod-
+      - name: Install go dependencies
+        if: steps.cache-go-dependencies.outputs.cache-hit != 'true'
+        run: go mod download
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+      - uses: ./.github/actions/setup-localstack
+      - uses: ./.github/actions/setup-azurite
+      - name: Run ${{ matrix.suite }} unit tests
+        run: make test-${{ matrix.suite }}
+        env:
+          S3MOCK_ENDPOINT: localhost:4566
+          DYNAMODBMOCK_ENDPOINT: http://localhost:4566
+          AWS_ACCESS_KEY_ID: fake
+          AWS_SECRET_ACCESS_KEY: fake
+          AZURITEMOCK_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+      - uses: ./.github/actions/teardown-localstack
+        if: always()
+      - uses: ./.github/actions/teardown-azurite
+        if: always()
+
+  image:
+    name: Build and push image
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push linux/amd64 and linux/arm64
+        # the Dockerfile cross-compiles in its builder stage, so no emulation is needed
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:staging-${SHORT_SHA}"
+          docker buildx create --use --name staging
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f build/Dockerfile \
+            --build-arg COMMIT="staging-${SHORT_SHA}" \
+            -t "${IMAGE}" \
+            --push .
+          echo "Pushed ${IMAGE}" >> "${GITHUB_STEP_SUMMARY}"
