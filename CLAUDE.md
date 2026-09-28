@@ -22,8 +22,8 @@
 | --- | --- | --- |
 | `main` | matches upstream | fast-forward only |
 | `develop` | `main` + personal baseline (this file, etc.), never goes upstream | merge `main` in |
-| `feat/<name>` | `develop` + one feature, for upstream | normal commits |
-| `fix/<name>` | `develop` + one bug fix, for upstream | normal commits |
+| `feat/<name>` | `develop` + one feature, for upstream | never merged into `develop`; goes upstream via `pr/` |
+| `fix/<name>` | `develop` + one bug fix, for upstream | never merged into `develop`; goes upstream via `pr/` |
 | `base/<name>` | `develop` + a change to the personal baseline, never goes upstream | merged back into `develop` |
 | `pr/<name>` | `main` + one `feat/` or `fix/` branch, for the upstream PR | rebuilt for each PR |
 | `staging` | `develop` + all pending `feat/*` and `fix/*` | rebuilt, force-pushed |
