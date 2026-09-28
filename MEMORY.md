@@ -7,9 +7,9 @@ upstream. Upstream: `project-zot/zot`. Branch rules and commit policy: see `CLAU
 
 | # | Task | Branch | Status |
 | --- | --- | --- | --- |
-| 1 | Upstream issue: bcrypt cost makes tests slow | `fix/test-bcrypt-cost` (`f77e51aa`) | fix done; upstream CI proof and `pkg/api` before/after collected; draft issue (next) |
+| 1 | Upstream PR: bcrypt cost makes tests slow | `pr/test-bcrypt-cost` (`a246781a`, on upstream `3995674d`) | evidence collected, PR body drafted; user opens the PR (no issue first) |
 | 2 | Confirm the bcrypt fix in staging CI | `staging` | not started: rebuild staging with it |
-| 3 | bbolt deadlock in the CVE scan task generator | `fix/boltdb-nested-tx-deadlock` (`02313f7f`) | documented in its `ISSUES.md`; fix and regression test not written; not reported upstream |
+| 3 | bbolt deadlock in the CVE scan task generator | `fix/boltdb-nested-tx-deadlock` (`8de5b5bd`, local only) | fixed with a TDD regression test, `cve` package passes; not pushed, no `pr/`, not reported upstream |
 | 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`484d3645`) | done and tested; upstream PR not opened |
 | 5 | `TestEventRecorderReload` flaky test fix | `feat/fix-events-reload-test` (`eaf568f4`) | done, passed in staging CI; upstream PR not opened |
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | done, passed in staging CI; upstream PR not opened |
@@ -121,17 +121,36 @@ it expects the GitHub runner's resolver text (`127.0.0.53`), the sandbox uses `8
 Setup notes for re-running: a `tester` user with its own module/build cache and worktrees under
 `/home/tester/bench` (root breaks the permission-based tests; `TestCookiestoreCleanup` panics).
 
-**Still to do:** draft the issue: problem, cause, upstream CI numbers above, local before/after
-(`pkg/api` and `pkg/extensions/search`), one-line fix.
+**Local re-run (2026-09-29, 16-core machine, not idle, one run at a time):** same command, upstream
+`main` @ `3995674d` vs `pr/test-bcrypt-cost`. `pkg/api` 882 s → 386 s (-56%),
+`pkg/extensions/search` 356 s → 62 s (-83%); `TestAuthorizationForTagUpdate` 116.4 → 5.3 s,
+`TestUserData` 128.8 → 4.4 s. Only `TestRedisCookieStore` failed, in both `pkg/api` runs.
+
+**PR (decided 2026-09-29):** open a PR directly, no issue. The code comment was dropped: the diff is
+just `10` → `bcrypt.MinCost`. `fix/test-bcrypt-cost` has the same change locally (`041dd9d2`), not
+pushed yet (origin still has the version with the comment). The PR body follows upstream's
+template and stays short, per the user: one reason sentence (`MinCost` is 4; a cost-10 compare
+takes ~1 s under `-race` on every authenticated request), the upstream CI table above (`pkg/api`
+1086 s, `search` 534 s median, run 36352277786 as the example) in the repro section, and the
+4-CPU before/after (`pkg/api` 1218 → 465 s, `search` 505 → 87.5 s) under "Testing done". Don't
+claim the job gets much shorter: `trivy` (~1125 s, no helper) sets the job length.
 
 ## Task 3: deadlock notes
 
 `BoltDB.FilterTags` calls `filterFunc` inside its `DB.View`; the CVE scan task generator's filter
-calls `GetImageMeta` (nested `DB.View`) through `IsResultCached` (added in #4410) and
-`IsImageFormatScannable` (older). A concurrent write that grows the DB file needs bbolt's mmap lock
-exclusively, which waits for the outer read transaction, while the nested one waits for the mmap
-lock. Full write-up, stacks and fix options in `ISSUES.md` on the branch. Drop `ISSUES.md` from
-the branch's `pr/`.
+called `GetImageMeta` (a nested `DB.View`) for every candidate, through `IsImageFormatScannable`
+(since #1833, 2023) and `IsResultCached` (#4410 added more calls). A concurrent write that grows the
+DB file needs bbolt's mmap lock exclusively, which waits for the outer read transaction, while the
+nested one waits for the mmap lock. Reproduced deterministically.
+
+Fix (`1c498f3c`, chosen by the user over changing `BoltDB.FilterTags`): the filter keeps only the
+in-memory checks; `Next()` runs `IsResultCached` / `IsImageFormatScannable` on `FilterTags`'
+result. Regression test `TestScanGeneratorConcurrentMetaDBWrite` failed before (blocked 15 s),
+passes after (~1 s); the `cve` package passes with `-race` and the extended tags; lint clean.
+Full write-up in `ISSUES.md` on the branch. Drop `ISSUES.md` from the branch's `pr/`.
+
+Local worktree `../zot-deadlock` needs `test/data` (symlink) and a copy of
+`pkg/extensions/build` (`go:embed` rejects symlinks) to run the `cve` tests.
 
 ## Notes for upstream PRs
 
