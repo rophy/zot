@@ -18,8 +18,13 @@
 
 ## Branch Workflow
 
-`main` matches upstream. `develop` is `main` plus personal commits (this file, etc.)
-that must never go upstream.
+| Branch | Contents | History |
+| --- | --- | --- |
+| `main` | matches upstream | fast-forward only |
+| `develop` | `main` + personal baseline (this file, etc.), never goes upstream | merge `main` in |
+| `feat/<name>` | `develop` + one feature | normal commits |
+| `pr/<name>` | `main` + one feature, for the upstream PR | rebuilt for each PR |
+| `staging` | `develop` + all pending `feat/*` | rebuilt, force-pushed |
 
 **Before working:**
 
@@ -40,6 +45,23 @@ git checkout -b pr/<name> feat/<name>
 git rebase --onto origin/main develop pr/<name>
 git diff --stat origin/main pr/<name>   # must not include CLAUDE.md or other develop-only files
 git push -u origin pr/<name>
+```
+
+**Staging:** `staging` consolidates all pending features. Rules:
+
+- Base it on `develop`, and merge only `feat/*` branches into it, never `pr/*`.
+- Never branch from `staging`: new `feat/` branches start from `develop`.
+- Rebuild it instead of accumulating history, whenever a feature is added, merged upstream,
+  dropped, or its `feat/` branch is rebased.
+- Resolve conflicts between features while merging into `staging`, not in the `feat/` branches.
+
+```bash
+git fetch origin
+git checkout -B staging origin/develop
+for b in origin/feat/<a> origin/feat/<b>; do   # every pending feat/ branch, one at a time
+  git merge --no-ff "$b"                        # resolve conflicts here, then continue
+done
+git push --force-with-lease origin staging
 ```
 
 ## Commit Author and Sign-off
