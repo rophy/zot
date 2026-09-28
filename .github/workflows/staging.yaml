@@ -20,7 +20,8 @@ jobs:
     name: Unit tests (${{ matrix.suite }})
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: true
+      # let both suites finish, so a failure in one does not hide the result of the other
+      fail-fast: false
       matrix:
         suite: [minimal, extended]
     steps:
