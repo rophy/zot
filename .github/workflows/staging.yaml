@@ -51,7 +51,16 @@ jobs:
       - uses: ./.github/actions/setup-localstack
       - uses: ./.github/actions/setup-azurite
       - name: Run ${{ matrix.suite }} unit tests
-        run: make test-${{ matrix.suite }}
+        # the tests of make test-<suite>, without coverage and with a longer timeout,
+        # since the per-package 20m timeout is too short on standard 4-core runners
+        run: |
+          make testdata-images
+          TAGS=""
+          if [ "${{ matrix.suite }}" = extended ]; then
+            TAGS="$(printf 'print-labels:\n\t@echo $(BUILD_LABELS)\n' | make -s -f Makefile -f - print-labels)"
+            make ui
+          fi
+          GOEXPERIMENT=jsonv2 go test -failfast ${TAGS:+-tags "$TAGS"} -trimpath -race -timeout 60m ./...
         env:
           S3MOCK_ENDPOINT: localhost:4566
           DYNAMODBMOCK_ENDPOINT: http://localhost:4566
