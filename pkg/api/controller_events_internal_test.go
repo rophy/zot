@@ -98,6 +98,16 @@ func eventsConfig(address string) *config.Config {
 }
 
 // refuteEvent reports whether the sink stayed silent long enough to be sure.
+// reloadedEventRecorder is what the controller logs when a reload rebuilds the event recorder.
+const reloadedEventRecorder = "reloaded event recorder"
+
+func readLog(logPath string) string {
+	data, err := os.ReadFile(logPath)
+	So(err, ShouldBeNil)
+
+	return string(data)
+}
+
 func refuteEvent(received chan *cloudevents.Event) bool {
 	select {
 	case <-received:
@@ -120,9 +130,10 @@ func TestEventRecorderReload(t *testing.T) {
 	Convey("A changed events config re-points the recorder without a restart", t, func() {
 		firstURL, firstSink := eventSink(t)
 		secondURL, secondSink := eventSink(t)
+		logPath := path.Join(t.TempDir(), "zot.log")
 
 		ctlr := NewController(eventsConfig(firstURL))
-		ctlr.Log = log.NewTestLogger()
+		ctlr.Log = log.NewLogger("debug", logPath)
 		So(ctlr.InitEventRecorder(), ShouldBeNil)
 
 		ctlr.EventRecorder.RepositoryCreated("repo", nil)
@@ -134,6 +145,7 @@ func TestEventRecorderReload(t *testing.T) {
 		ctlr.EventRecorder.RepositoryCreated("repo", nil)
 		So(awaitEvent(secondSink), ShouldNotBeNil)
 		So(refuteEvent(firstSink), ShouldBeTrue)
+		So(readLog(logPath), ShouldContainSubstring, reloadedEventRecorder)
 	})
 
 	Convey("Events enabled by a reload start being delivered", t, func() {
@@ -170,9 +182,10 @@ func TestEventRecorderReload(t *testing.T) {
 
 	Convey("An unchanged events config keeps the same recorder", t, func() {
 		sinkURL, sink, opened := countingEventSink(t)
+		logPath := path.Join(t.TempDir(), "zot.log")
 
 		ctlr := NewController(eventsConfig(sinkURL))
-		ctlr.Log = log.NewTestLogger()
+		ctlr.Log = log.NewLogger("debug", logPath)
 		So(ctlr.InitEventRecorder(), ShouldBeNil)
 
 		// deliver first, so a keep-alive connection is open when the reload lands
@@ -182,10 +195,12 @@ func TestEventRecorderReload(t *testing.T) {
 
 		ctlr.LoadNewConfig(eventsConfig(sinkURL))
 
-		// a rebuild would have dialled a second connection
+		// Not checked by counting connections: whether the next event reuses the connection depends
+		// on when the HTTP client's read loop returns it to the idle pool, which can lag behind here.
+		So(readLog(logPath), ShouldNotContainSubstring, reloadedEventRecorder)
+
 		ctlr.EventRecorder.RepositoryCreated("repo", nil)
 		So(awaitEvent(sink), ShouldNotBeNil)
-		So(opened.Load(), ShouldEqual, 1)
 	})
 }
 
