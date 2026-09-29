@@ -1,7 +1,7 @@
 # Issues
 
 Open work in the fork `rophy/zot`. This file lives on `develop` and never goes upstream. Remove an
-entry once it is merged upstream or dropped. Handover notes: `MEMORY.md`.
+entry once it is merged upstream or dropped.
 
 ## Open issues
 
@@ -16,3 +16,6 @@ entry once it is merged upstream or dropped. Handover notes: `MEMORY.md`.
 (https://github.com/rophy/zot/actions/runs/36436324063): minimal suite passed; extended suite
 passed everything except `pkg/extensions/search/cve`, which hit the bbolt deadlock since fixed
 upstream (#4483). No staging image has been pushed yet (`ghcr.io/rophy/zot:staging-<short-sha>`, private by default).
+
+Issues 4 and 6 both add an import to `pkg/scheduler/scheduler_test.go`; whichever merges upstream
+second needs a trivial rebase.

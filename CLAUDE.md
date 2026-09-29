@@ -81,3 +81,29 @@ git config user.name "Rophy Tsai"
 git config user.email "rophy@users.noreply.github.com"
 git commit -s
 ```
+
+## Upstream Issues and PRs
+
+- The user opens upstream issues and PRs unless they ask otherwise.
+- Before drafting or creating one, check what already exists: several sessions work in parallel.
+  Run `gh issue list` and `gh pr list --repo project-zot/zot --author rophy --state all`, and
+  check whether the head branch already has a PR.
+- Track open work in `ISSUES.md` (develop only); remove an entry once it is merged or dropped.
+
+## Environment
+
+- The Makefile exports `GOEXPERIMENT=jsonv2`; install Go tools with
+  `env -u GOEXPERIMENT GOTOOLCHAIN=go1.27.0 go install ...` (e.g. golangci-lint `v2.13.2`,
+  swag `v1.16.6`, actionlint).
+- `make testdata-images` needs skopeo.
+- Tests built with the `ui` tag need `pkg/extensions/build` (`make ui`); `go:embed` rejects a
+  symlinked copy, so a git worktree needs a real copy.
+
+Cloud sessions:
+
+- The sandbox runs as root: permission-based tests fail there (`pkg/storage/gc` sync staging,
+  `TestCopyFiles`, `TestLogErrors`, `TestAPIKeysOpenDBError`, `TestCookiestoreCleanup` panic, ...)
+  but pass in CI. Compare against `develop` before blaming a change.
+- The preinstalled golangci-lint is too old for Go 1.27.
+- Docker builds need the proxy CA inside the build (see `/root/.ccr/README.md`).
+- GitHub access can't re-run or dispatch workflows, or delete branches (403); the user does those.
