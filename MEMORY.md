@@ -7,9 +7,6 @@ upstream. Upstream: `project-zot/zot`. Branch rules and commit policy: see `CLAU
 
 | # | Task | Branch | Status |
 | --- | --- | --- | --- |
-| 1 | Upstream PR: bcrypt cost makes tests slow | `pr/test-bcrypt-cost` (`a246781a`, on upstream `3995674d`) | evidence collected, PR body drafted; user opens the PR (no issue first) |
-| 2 | Confirm the bcrypt fix in staging CI | `staging` | not started: rebuild staging with it |
-| 3 | bbolt deadlock in the CVE scan task generator | `pr/boltdb-nested-tx-deadlock` (`595fc32d`, pushed); `fix/` (`8ec7e179`, local only) | issue filed: project-zot/zot#4484; PR body drafted (`../zot-deadlock/pr.md`); user opens the PR |
 | 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`484d3645`) | done and tested; upstream PR not opened |
 | 5 | `TestEventRecorderReload` flaky test fix | `feat/fix-events-reload-test` (`eaf568f4`) | done, passed in staging CI; upstream PR not opened |
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | done, passed in staging CI; upstream PR not opened |
@@ -17,152 +14,17 @@ upstream. Upstream: `project-zot/zot`. Branch rules and commit policy: see `CLAU
 
 `staging` (`ab29194e`) = `develop` (older) + tasks 4, 5, 6. Its last CI run
 (https://github.com/rophy/zot/actions/runs/36436324063): minimal suite passed; extended suite
-passed everything except `pkg/extensions/search/cve`, which hit the task 3 deadlock. No staging
+passed everything except `pkg/extensions/search/cve`, which hit the bbolt deadlock since fixed
+upstream (#4483). No staging
 image has been pushed yet (`ghcr.io/rophy/zot:staging-<short-sha>`, private by default).
-
-## Task 1: upstream issue about slow tests from bcrypt cost
-
-**Goal:** file an issue on `project-zot/zot` showing that the test htpasswd credentials' bcrypt
-cost makes the auth-heavy tests very slow, with proof from upstream's own CI, then offer the fix
-(one line in `pkg/test/common/fs.go`: cost 10 → `bcrypt.MinCost`).
-
-**Upstream CI logs:** `gh` (logged in as `rophy`, on the user's machine) reads them with
-`gh api repos/project-zot/zot/actions/jobs/<job-id>/logs`. Cloud sessions without
-`project-zot/zot` attached can't; they read this file from
-https://raw.githubusercontent.com/rophy/zot/develop/MEMORY.md.
-
-**Cause (verified):**
-
-- `test.GetBcryptCredString` (`pkg/test/common/fs.go`) hashes test passwords with bcrypt cost 10.
-- htpasswd verifies the hash on every authenticated request, with no cache
-  (`HTPasswd.Authenticate`, `pkg/api/htpasswd.go`).
-- The tests run with `-race`, which makes bcrypt about 14x slower.
-
-**Evidence already collected (upstream code, `main` @ `4f79e998`):**
-
-| Measurement | cost 10 | `bcrypt.MinCost` |
-| --- | --- | --- |
-| one bcrypt cost-10 compare, normal build | 69 ms | |
-| one bcrypt cost-10 compare, `-race` | 998 ms | |
-| `TestUserData` (`pkg/extensions/search`) | 184.7 s | 6.2 s |
-| 7 slowest `pkg/extensions/search` tests together | 392 s | 12 s |
-| whole `pkg/extensions/search` package | 505 s | 87.5 s |
-
-Measured locally with the `make test-extended` build tags and `-race`. In the fork's CI
-(4-core `ubuntu-latest`) `pkg/extensions/search` took 569 s and `pkg/api` 1341 s. 25 test files
-use the helper (`pkg/api`, `pkg/extensions/...`, `pkg/cli/...`, `pkg/log`, `pkg/debug/pprof`,
-`pkg/test/...`), so the saving goes beyond `search`. Failures seen when running these packages
-locally also happen without the change (root sandbox, see below).
-
-Reproduce: run `go test -race -json -run '^TestUserData$'` with the `make test-extended` tags on
-`./pkg/extensions/search/`, before and after changing the cost in `GetBcryptCredString`.
-
-**Upstream CI evidence (collected 2026-09-29):** the 8 latest successful `test.yaml` push runs
-on `main`, job "Run zot with extensions tests". It runs
-`go test -failfast -tags <extensions> -trimpath -race -timeout 20m -cover ... ./...` (Makefile
-`test-extended`), without `-v`, so the logs only give per-package times (seconds):
-
-| Run / job | Date | Commit | Job | `pkg/api` | `pkg/extensions/search` | `pkg/cli/server` | `.../search/cve` | `pkg/extensions/sync` |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [36352277786](https://github.com/project-zot/zot/actions/runs/36352277786/job/108717836448) | 2026-09-27 | `4f79e998` | 24m21s | 1084 | 530 | 459 | 393 | 379 |
-| [36349169550](https://github.com/project-zot/zot/actions/runs/36349169550/job/108704328777) | 2026-09-27 | `daf3f4dc` | 24m3s | 1073 | 532 | 441 | 384 | 372 |
-| [36332986476](https://github.com/project-zot/zot/actions/runs/36332986476/job/108658375486) | 2026-09-27 | `7daa9281` | 24m12s | 1095 | 525 | 480 | 397 | 404 |
-| [36319801875](https://github.com/project-zot/zot/actions/runs/36319801875/job/108621321169) | 2026-09-27 | `dc319658` | 24m5s | 1077 | 538 | 444 | 379 | 389 |
-| [36304865840](https://github.com/project-zot/zot/actions/runs/36304865840/job/108579384090) | 2026-09-27 | `325356d8` | 24m51s | 1100 | 543 | 461 | 401 | 400 |
-| [36221655026](https://github.com/project-zot/zot/actions/runs/36221655026/job/108347930269) | 2026-09-26 | `177fc0a7` | 24m3s | 1086 | 534 | 444 | 392 | 363 |
-| [36195188960](https://github.com/project-zot/zot/actions/runs/36195188960/job/108269305210) | 2026-09-25 | `f4bf01c0` | 24m58s | 1087 | 535 | 467 | 402 | 405 |
-| [36181271579](https://github.com/project-zot/zot/actions/runs/36181271579/job/108223960862) | 2026-09-25 | `2d721b46` | 24m15s | 1099 | 539 | 454 | 398 | 403 |
-
-- `pkg/api` takes ~1086 s against the 20m (1200 s) per-package timeout: ~90% of the budget. The
-  timeout was last raised 15m → 20m in `7642e5af` (Dec 2023). In the job without extensions
-  (`-timeout 12m`), `pkg/api` takes only ~130 s.
-- The slowest package, `pkg/extensions/search/cve/trivy` (~1125 s, once timed out at 20m in run
-  35320388162), does not use the helper: not a bcrypt case, don't claim it in the issue.
-- Other slow packages without the helper: `pkg/storage/gc`, `pkg/storage`, `pkg/storage/s3`,
-  `pkg/extensions/imagetrust`, `pkg/exporter/api`.
-- No "test timed out" failure in a helper-using package among ~45 failed extension/minimal jobs
-  checked (failed `test.yaml` runs 2026-09-17 to 09-27, mostly PRs).
-- No existing upstream issue or PR about bcrypt cost or slow tests (searched 2026-09-29).
-
-**`pkg/api` code involved (upstream `main` @ `4f79e998`):**
-
-- Hash: `pkg/test/common/fs.go:243` `bcrypt.GenerateFromPassword(pw, 10)`, once per helper call
-  (~1 s under `-race`). **This is the line to tune** (→ `bcrypt.MinCost`).
-- Compare: `pkg/api/authn.go:202` `basicAuthn` → `HTPasswd.Authenticate` →
-  `pkg/api/htpasswd.go:111` `bcrypt.CompareHashAndPassword`, on every basic-auth request, no cache
-  (~1 s under `-race`). This dominates: tests send dozens to hundreds of authenticated requests.
-- Helper call sites in `pkg/api`: `controller_test.go` ~60 (build tags `sync && scrub && metrics
-  && search && lint && userprefs && mgmt && imagetrust && ui`, so it only runs in the extensions
-  job; this explains 1086 s vs 130 s), `htpasswd_test.go` ~30 (no tags), `authn_test.go` 4
-  (`mgmt`), `mtls_test.go` 3, `routes_test.go` 1. Loops that hash several credential strings:
-  `controller_test.go:922-929`, `:979`, `:7856`.
-
-**`pkg/api` before/after (measured 2026-09-29):** whole package, `go test -json -race -trimpath
--timeout 60m` with tags `events,imagetrust,lint,metrics,mgmt,profile,scrub,search,sync,ui,userprefs`
-(no coverage), run as a non-root user on a 4-CPU cloud sandbox. Before = upstream `main` @
-`4f79e998`, after = `fix/test-bcrypt-cost` (`f77e51aa`, only `pkg/test/common/fs.go` differs).
-All 284 top-level tests ran in both.
-
-| | before (cost 10) | after (`MinCost`) |
-| --- | --- | --- |
-| package | 1218 s (over the 1200 s CI timeout) | 465 s (-62%) |
-| `TestAuthorizationForTagUpdate` | 164.2 s | 6.6 s |
-| `TestAuthorization` | 50.7 s | 1.9 s |
-| `TestPagedRepositoriesWithAuthorization` | 50.1 s | 1.8 s |
-| `TestScaleOutRequestProxy` | 46.2 s | 7.7 s |
-| `TestRoutes` | 42.4 s | 6.9 s |
-| `TestSearchRoutes` | 41.8 s | 2.2 s |
-| `TestHTPasswdWatcher` | 34.3 s | 3.3 s |
-| `TestOpenIDMiddleware` | 26.1 s | 5.4 s |
-
-Unchanged (no htpasswd): `TestBasicAuthWithReloadedCredentials` 114.9 s, `TestInterruptedBlobUpload`
-~62 s, `TestLDAPClient` / `TestLDAPWithoutCreds` 28 s. `TestRedisCookieStore` failed in both runs:
-it expects the GitHub runner's resolver text (`127.0.0.53`), the sandbox uses `8.8.8.8`; unrelated.
-Setup notes for re-running: a `tester` user with its own module/build cache and worktrees under
-`/home/tester/bench` (root breaks the permission-based tests; `TestCookiestoreCleanup` panics).
-
-**Local re-run (2026-09-29, 16-core machine, not idle, one run at a time):** same command, upstream
-`main` @ `3995674d` vs `pr/test-bcrypt-cost`. `pkg/api` 882 s → 386 s (-56%),
-`pkg/extensions/search` 356 s → 62 s (-83%); `TestAuthorizationForTagUpdate` 116.4 → 5.3 s,
-`TestUserData` 128.8 → 4.4 s. Only `TestRedisCookieStore` failed, in both `pkg/api` runs.
-
-**PR (decided 2026-09-29):** open a PR directly, no issue. The code comment was dropped: the diff is
-just `10` → `bcrypt.MinCost`. `fix/test-bcrypt-cost` has the same change locally (`041dd9d2`), not
-pushed yet (origin still has the version with the comment). The PR body follows upstream's
-template and stays short, per the user: one reason sentence (`MinCost` is 4; a cost-10 compare
-takes ~1 s under `-race` on every authenticated request), the upstream CI table above (`pkg/api`
-1086 s, `search` 534 s median, run 36352277786 as the example) in the repro section, and the
-4-CPU before/after (`pkg/api` 1218 → 465 s, `search` 505 → 87.5 s) under "Testing done". Don't
-claim the job gets much shorter: `trivy` (~1125 s, no helper) sets the job length.
-
-## Task 3: deadlock notes
-
-`BoltDB.FilterTags` calls `filterFunc` inside its `DB.View`; the CVE scan task generator's filter
-called `GetImageMeta` (a nested `DB.View`) for every candidate, through `IsImageFormatScannable`
-(since #1833, 2023) and `IsResultCached` (#4410 added more calls). A concurrent write that grows the
-DB file needs bbolt's mmap lock exclusively, which waits for the outer read transaction, while the
-nested one waits for the mmap lock. Reproduced deterministically.
-
-Upstream issue: https://github.com/project-zot/zot/issues/4484 (filed 2026-09-29). Its repro test is
-the PR's regression test with a 1 MiB write (bbolt's initial mmap is 32 KB); it fails 3/3 on upstream
-`main` @ `3995674d`. The user wants issue text short and readable without the code: no function-call
-chains in the description, sources for claims (bbolt README v1.5.0 L163-168).
-
-Fix (`6162f79c` on `fix/`, `595fc32d` on `pr/`, chosen by the user over changing `BoltDB.FilterTags`): the filter keeps only the
-in-memory checks; `Next()` runs `IsResultCached` / `IsImageFormatScannable` on `FilterTags`'
-result. Regression test `TestScanGeneratorConcurrentMetaDBWrite` failed before (blocked 15 s),
-passes after (~1 s); the `cve` package passes with `-race` and the extended tags; lint clean.
-Full write-up in `ISSUES.md` on the branch. Drop `ISSUES.md` from the branch's `pr/`.
-
-`TestScanGeneratorWithRealData` downloads the 118 MiB Trivy DB from ghcr.io (~900 KiB/s here):
-167-576 s locally, unrelated to the fix.
-
-Local worktree `../zot-deadlock` needs `test/data` (symlink) and a copy of
-`pkg/extensions/build` (`go:embed` rejects symlinks) to run the `cve` tests.
 
 ## Notes for upstream PRs
 
 - Build `pr/<name>` per `CLAUDE.md`; the user signs commits off (DCO) and opens the PRs.
+- Before creating any upstream issue or PR, check for existing ones:
+  `gh issue list` / `gh pr list --repo project-zot/zot --author rophy --state all`, and whether the
+  head branch already has a PR. Several sessions work in parallel; duplicates happened (#4484, #4485).
+- Merged upstream: bcrypt test cost (#4481), bbolt deadlock in the CVE scan generator (#4482/#4483).
 - The GC and scheduler-test branches both add an import to `pkg/scheduler/scheduler_test.go`;
   whichever merges upstream second needs a trivial rebase.
 
