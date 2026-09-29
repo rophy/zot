@@ -1,0 +1,81 @@
+name: Scheduler flake experiment
+
+# Runs the minimal unit test suite, as staging.yaml does, several times in parallel on standard
+# 4-core runners, to measure how often TestScheduler fails: on develop as is ("unfixed"), and with
+# the test fix from feat/fix-scheduler-fairness-test applied ("fixed").
+# Push to this branch, or re-run the workflow, to collect more samples.
+on:
+  push:
+    branches:
+      - ci/scheduler-flake
+
+permissions: read-all
+
+jobs:
+  unit-tests:
+    name: Minimal unit tests (${{ matrix.variant }} ${{ matrix.run }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [unfixed, fixed]
+        run: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the scheduler test fix
+        if: matrix.variant == 'fixed'
+        run: |
+          git fetch --depth=2 origin b8dbe75f9937dc3dd670ce6a9de44f0673a8cda5
+          git cherry-pick --no-commit FETCH_HEAD
+          git diff --stat HEAD
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          cache: false
+          check-latest: true
+          go-version-file: .go-version
+      - name: Cache go dependencies
+        id: cache-go-dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mod-
+      - name: Install go dependencies
+        if: steps.cache-go-dependencies.outputs.cache-hit != 'true'
+        run: go mod download
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+      - uses: ./.github/actions/setup-localstack
+      - uses: ./.github/actions/setup-azurite
+      - name: Run minimal unit tests
+        run: |
+          make testdata-images
+          GOEXPERIMENT=jsonv2 go test -failfast -trimpath -race -timeout 60m ./... 2>&1 | tee test.log
+        env:
+          S3MOCK_ENDPOINT: localhost:4566
+          DYNAMODBMOCK_ENDPOINT: http://localhost:4566
+          AWS_ACCESS_KEY_ID: fake
+          AWS_SECRET_ACCESS_KEY: fake
+          AZURITEMOCK_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+      - name: Report the TestScheduler result
+        if: always()
+        run: |
+          if grep -q -- '--- FAIL: TestScheduler' test.log; then
+            result=FAIL
+          elif grep -q 'zotregistry.dev/zot/v2/pkg/scheduler' test.log; then
+            result=PASS
+          else
+            result=NOT-RUN
+          fi
+          echo "TestScheduler ${{ matrix.variant }} ${{ matrix.run }}: ${result}" | tee -a "${GITHUB_STEP_SUMMARY}"
+          echo "::notice title=TestScheduler::${{ matrix.variant }} ${{ matrix.run }}: ${result}"
+      - uses: ./.github/actions/teardown-localstack
+        if: always()
+      - uses: ./.github/actions/teardown-azurite
+        if: always()
