@@ -9,7 +9,7 @@ upstream. Upstream: `project-zot/zot`. Branch rules and commit policy: see `CLAU
 | --- | --- | --- | --- |
 | 1 | Upstream PR: bcrypt cost makes tests slow | `pr/test-bcrypt-cost` (`a246781a`, on upstream `3995674d`) | evidence collected, PR body drafted; user opens the PR (no issue first) |
 | 2 | Confirm the bcrypt fix in staging CI | `staging` | not started: rebuild staging with it |
-| 3 | bbolt deadlock in the CVE scan task generator | `fix/boltdb-nested-tx-deadlock` (`8de5b5bd`, local only) | fixed with a TDD regression test, `cve` package passes; not pushed, no `pr/`, not reported upstream |
+| 3 | bbolt deadlock in the CVE scan task generator | `pr/boltdb-nested-tx-deadlock` (`595fc32d`, pushed); `fix/` (`8ec7e179`, local only) | issue filed: project-zot/zot#4484; PR body drafted (`../zot-deadlock/pr.md`); user opens the PR |
 | 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`484d3645`) | done and tested; upstream PR not opened |
 | 5 | `TestEventRecorderReload` flaky test fix | `feat/fix-events-reload-test` (`eaf568f4`) | done, passed in staging CI; upstream PR not opened |
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | done, passed in staging CI; upstream PR not opened |
@@ -143,11 +143,19 @@ called `GetImageMeta` (a nested `DB.View`) for every candidate, through `IsImage
 DB file needs bbolt's mmap lock exclusively, which waits for the outer read transaction, while the
 nested one waits for the mmap lock. Reproduced deterministically.
 
-Fix (`1c498f3c`, chosen by the user over changing `BoltDB.FilterTags`): the filter keeps only the
+Upstream issue: https://github.com/project-zot/zot/issues/4484 (filed 2026-09-29). Its repro test is
+the PR's regression test with a 1 MiB write (bbolt's initial mmap is 32 KB); it fails 3/3 on upstream
+`main` @ `3995674d`. The user wants issue text short and readable without the code: no function-call
+chains in the description, sources for claims (bbolt README v1.5.0 L163-168).
+
+Fix (`6162f79c` on `fix/`, `595fc32d` on `pr/`, chosen by the user over changing `BoltDB.FilterTags`): the filter keeps only the
 in-memory checks; `Next()` runs `IsResultCached` / `IsImageFormatScannable` on `FilterTags`'
 result. Regression test `TestScanGeneratorConcurrentMetaDBWrite` failed before (blocked 15 s),
 passes after (~1 s); the `cve` package passes with `-race` and the extended tags; lint clean.
 Full write-up in `ISSUES.md` on the branch. Drop `ISSUES.md` from the branch's `pr/`.
+
+`TestScanGeneratorWithRealData` downloads the 118 MiB Trivy DB from ghcr.io (~900 KiB/s here):
+167-576 s locally, unrelated to the fix.
 
 Local worktree `../zot-deadlock` needs `test/data` (symlink) and a copy of
 `pkg/extensions/build` (`go:embed` rejects symlinks) to run the `cve` tests.
