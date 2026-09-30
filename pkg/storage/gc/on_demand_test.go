@@ -108,6 +108,7 @@ func TestGarbageCollectOnDemand(t *testing.T) {
 			}), ShouldBeTrue)
 
 			So(blobExists(imgStore, orphan), ShouldBeFalse)
+			So(onDemand.Status().Deleted.Blobs, ShouldEqual, 1)
 		})
 
 		Convey("SweepNow runs outside the configured time window", func() {
@@ -157,6 +158,7 @@ func TestGarbageCollectOnDemand(t *testing.T) {
 
 			status, _ := onDemand.RepoStatus(onDemandRepo)
 			So(status.Error, ShouldBeEmpty)
+			So(status.Deleted, ShouldResemble, gc.DeletedCounts{Blobs: 1})
 			So(blobExists(imgStore, orphan), ShouldBeFalse)
 
 			// the store-wide sweep did not run

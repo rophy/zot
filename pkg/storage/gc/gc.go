@@ -116,12 +116,17 @@ It also gc referrers with missing subject if the Referrer Option is enabled
 It also gc untagged manifests.
 */
 func (gc GarbageCollect) CleanRepo(ctx context.Context, repo string) error {
+	return gc.runCleanRepo(ctx, repo, nil)
+}
+
+// runCleanRepo runs CleanRepo and, if deleted is not nil, reports what was deleted.
+func (gc GarbageCollect) runCleanRepo(ctx context.Context, repo string, deleted *DeletedCounts) error {
 	gc.log.Info().Str("module", "gc").
 		Msg("executing gc of orphaned blobs for " + path.Join(gc.imgStore.RootDir(), repo))
 
 	start := time.Now()
 
-	if err := gc.cleanRepo(ctx, repo); err != nil {
+	if err := gc.cleanRepo(ctx, repo, deleted); err != nil {
 		monitoring.ObserveGCDuration(gc.metrics, time.Since(start))
 		monitoring.IncGCRuns(gc.metrics, true)
 
@@ -142,7 +147,8 @@ func (gc GarbageCollect) CleanRepo(ctx context.Context, repo string) error {
 	return nil
 }
 
-func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
+// cleanRepo collects a repository and, if deleted is not nil, reports what was deleted.
+func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string, deleted *DeletedCounts) error {
 	var lockLatency time.Time
 
 	dir := path.Join(gc.imgStore.RootDir(), repo)
@@ -262,6 +268,10 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 		monitoring.IncGCDeleted(gc.metrics, "manifest", manifestsDeleted)
 		monitoring.IncGCDeleted(gc.metrics, "blob", blobsDeleted)
 		monitoring.IncGCDeleted(gc.metrics, "upload", uploadsDeleted)
+
+		if deleted != nil {
+			*deleted = DeletedCounts{Manifests: manifestsDeleted, Blobs: blobsDeleted, Uploads: uploadsDeleted}
+		}
 	}
 
 	return nil
@@ -1311,8 +1321,8 @@ type gcTask struct {
 	imgStore types.ImageStore
 	gc       GarbageCollect
 	repo     string
-	// onDone, if set, is called with the result once the task has run.
-	onDone func(err error)
+	// onDone, if set, is called with what was deleted and the result once the task has run.
+	onDone func(deleted DeletedCounts, err error)
 }
 
 func NewGCTask(imgStore types.ImageStore, gc GarbageCollect, repo string,
@@ -1321,11 +1331,13 @@ func NewGCTask(imgStore types.ImageStore, gc GarbageCollect, repo string,
 }
 
 func (gct *gcTask) DoWork(ctx context.Context) error {
+	var deleted DeletedCounts
+
 	// run task
-	err := gct.gc.CleanRepo(ctx, gct.repo) //nolint: contextcheck
+	err := gct.gc.runCleanRepo(ctx, gct.repo, &deleted) //nolint: contextcheck
 
 	if gct.onDone != nil {
-		gct.onDone(err)
+		gct.onDone(deleted, err)
 	}
 
 	return err

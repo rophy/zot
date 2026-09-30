@@ -71,7 +71,8 @@ func (h *GCHandler) RunGC(response http.ResponseWriter, request *http.Request) {
 
 // GetGCStatus godoc
 // @Summary Get the status of garbage collection
-// @Description Returns the status of the current or last GC run of a store, or of a single repository in it.
+// @Description Returns the status of the current or last GC run of a store, or of a single repository in it,
+// @Description including what it deleted.
 // @Description Admin only.
 // @Router  /v2/_zot/ext/mgmt/gc [get]
 // @Produce json

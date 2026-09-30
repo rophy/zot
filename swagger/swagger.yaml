@@ -175,8 +175,22 @@ definitions:
       releaseTag:
         type: string
     type: object
+  gc.DeletedCounts:
+    properties:
+      blobs:
+        type: integer
+      manifests:
+        type: integer
+      uploads:
+        type: integer
+    type: object
   gc.RunStatus:
     properties:
+      deleted:
+        allOf:
+        - $ref: '#/definitions/gc.DeletedCounts'
+        description: Deleted is what the run deleted so far, from the repositories
+          collected without error.
       error:
         description: Error is the last error returned during the run, while listing
           or collecting repositories.
@@ -369,7 +383,8 @@ paths:
   /v2/_zot/ext/mgmt/gc:
     get:
       description: |-
-        Returns the status of the current or last GC run of a store, or of a single repository in it.
+        Returns the status of the current or last GC run of a store, or of a single repository in it,
+        including what it deleted.
         Admin only.
       parameters:
       - description: 'store route: / for the default store, otherwise a subPaths key'

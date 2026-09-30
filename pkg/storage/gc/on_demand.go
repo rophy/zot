@@ -10,11 +10,26 @@ import (
 	"zotregistry.dev/zot/v2/pkg/scheduler"
 )
 
+// DeletedCounts is what a GC run deleted.
+type DeletedCounts struct {
+	Manifests int `json:"manifests"`
+	Blobs     int `json:"blobs"`
+	Uploads   int `json:"uploads"`
+}
+
+func (dc *DeletedCounts) add(other DeletedCounts) {
+	dc.Manifests += other.Manifests
+	dc.Blobs += other.Blobs
+	dc.Uploads += other.Uploads
+}
+
 // RunStatus is the status of a GC run, either a sweep of the whole image store or of a single repository.
 type RunStatus struct {
 	Running    bool      `json:"running"`
 	StartedAt  time.Time `json:"startedAt,omitzero"`
 	FinishedAt time.Time `json:"finishedAt,omitzero"`
+	// Deleted is what the run deleted so far, from the repositories collected without error.
+	Deleted DeletedCounts `json:"deleted"`
 	// Error is the last error returned during the run, while listing or collecting repositories.
 	Error string `json:"error,omitempty"`
 }
@@ -87,8 +102,8 @@ func (od *OnDemand) CleanRepoNow(repo string) error {
 	}
 
 	task := NewGCTask(od.gc.imgStore, od.gc, repo)
-	task.onDone = func(err error) {
-		od.repoDone(repo, err)
+	task.onDone = func(deleted DeletedCounts, err error) {
+		od.repoDone(repo, deleted, err)
 	}
 
 	previous, hadPrevious := od.repos[repo]
@@ -122,13 +137,14 @@ func (od *OnDemand) RepoStatus(repo string) (RunStatus, bool) {
 	return *status, true
 }
 
-func (od *OnDemand) repoDone(repo string, err error) {
+func (od *OnDemand) repoDone(repo string, deleted DeletedCounts, err error) {
 	od.reposLock.Lock()
 	defer od.reposLock.Unlock()
 
 	status := od.repos[repo]
 	status.Running = false
 	status.FinishedAt = time.Now()
+	status.Deleted = deleted
 
 	if err != nil {
 		status.Error = err.Error()
@@ -203,11 +219,12 @@ func (s *sweepState) taskStarted() {
 	s.inflight++
 }
 
-func (s *sweepState) taskDone(err error) {
+func (s *sweepState) taskDone(deleted DeletedCounts, err error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
 	s.inflight--
+	s.last.Deleted.add(deleted)
 
 	if err != nil {
 		s.last.Error = err.Error()

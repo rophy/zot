@@ -102,9 +102,15 @@ curl -u admin:password "http://localhost:8080/v2/_zot/ext/mgmt/gc?store=/&repo=a
 {
   "running": false,
   "startedAt": "2026-09-28T03:12:56.543226023Z",
-  "finishedAt": "2026-09-28T03:12:57.345123455Z"
+  "finishedAt": "2026-09-28T03:12:57.345123455Z",
+  "deleted": {
+    "manifests": 0,
+    "blobs": 3,
+    "uploads": 0
+  }
 }
 ```
 
-`error` is set to the last error if listing or collecting repositories failed. A sweep which can't list
-repositories keeps running, and is retried until it can.
+`deleted` counts what was deleted from the repositories collected without error. `error` is set to the
+last error if listing or collecting repositories failed. A sweep which can't list repositories keeps running,
+and is retried until it can.

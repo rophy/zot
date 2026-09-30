@@ -173,7 +173,7 @@ const docTemplate = `{
         },
         "/v2/_zot/ext/mgmt/gc": {
             "get": {
-                "description": "Returns the status of the current or last GC run of a store, or of a single repository in it.\nAdmin only.",
+                "description": "Returns the status of the current or last GC run of a store, or of a single repository in it,\nincluding what it deleted.\nAdmin only.",
                 "produces": [
                     "application/json"
                 ],
@@ -1639,9 +1639,31 @@ const docTemplate = `{
                 }
             }
         },
+        "gc.DeletedCounts": {
+            "type": "object",
+            "properties": {
+                "blobs": {
+                    "type": "integer"
+                },
+                "manifests": {
+                    "type": "integer"
+                },
+                "uploads": {
+                    "type": "integer"
+                }
+            }
+        },
         "gc.RunStatus": {
             "type": "object",
             "properties": {
+                "deleted": {
+                    "description": "Deleted is what the run deleted so far, from the repositories collected without error.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/gc.DeletedCounts"
+                        }
+                    ]
+                },
                 "error": {
                     "description": "Error is the last error returned during the run, while listing or collecting repositories.",
                     "type": "string"

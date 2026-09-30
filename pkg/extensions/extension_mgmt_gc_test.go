@@ -159,9 +159,11 @@ func TestMgmtGC(t *testing.T) {
 				return !status.Running && !status.FinishedAt.IsZero()
 			}, 30*time.Second), ShouldBeTrue)
 
-			// the manifest was removed from the index by the delete, GC removes its blobs
+			// the manifest was removed from the index by the delete, GC removed its blobs
 			status := getGCStatus(gcURL, adminUser, adminPass, map[string]string{"store": "/", "repo": "repo1"})
 			So(status.Error, ShouldBeEmpty)
+			So(status.Deleted.Manifests, ShouldEqual, 0)
+			So(status.Deleted.Blobs, ShouldBeGreaterThan, 0)
 
 			resp, err = resty.R().SetBasicAuth(user, userPass).Head(layerURL)
 			So(err, ShouldBeNil)

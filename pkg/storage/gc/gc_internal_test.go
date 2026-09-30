@@ -134,7 +134,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				},
 			}, gcOptions, audit, log, metrics)
 
-			err := gc.cleanRepo(ctx, repoName)
+			err := gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -150,7 +150,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			err := gc.cleanRepo(ctx, repoName)
+			err := gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -176,7 +176,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, audit, log, metrics)
 
-			err := gc.cleanRepo(ctx, repoName)
+			err := gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldBeNil)
 			So(metaCalled, ShouldBeTrue)
 		})
@@ -288,7 +288,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			err = gc.cleanRepo(ctx, repoName)
+			err = gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -312,7 +312,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			err = gc.cleanRepo(ctx, repoName)
+			err = gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -325,7 +325,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			err := gc.cleanRepo(ctx, repoName)
+			err := gc.cleanRepo(ctx, repoName, nil)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -2670,7 +2670,7 @@ func TestCleanRepoWithStaleManifestEntries(t *testing.T) {
 
 		gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-		err = gc.cleanRepo(ctx, repoName)
+		err = gc.cleanRepo(ctx, repoName, nil)
 		So(err, ShouldBeNil)
 		So(len(savedIndex.Manifests), ShouldEqual, 1)
 		So(savedIndex.Manifests[0].Digest, ShouldEqual, existingDigest)
