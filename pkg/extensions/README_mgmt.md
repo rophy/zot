@@ -49,7 +49,9 @@ If any key is present under `'auth'` key, in the mgmt response, it means that pa
 ## Run garbage collection
 
 Starts garbage collection of a store, or of a single repository in it, before the next periodic run is due.
-It uses the store's own GC settings (`gcDelay`, retention policies). Only admins can use it.
+It uses the store's own GC settings (`gcDelay`, retention policies). Only admins can use it: users or groups
+in `accessControl.adminPolicy`. As elsewhere in zot, without `accessControl` every user is an admin, so any user
+(or, without authentication, anyone) can request GC.
 
 The `store` parameter is `/` for the default store, otherwise a `subPaths` key. GC must be enabled for the store.
 Like the rest of `mgmt`, this endpoint is only available when the `search` extension is enabled.
@@ -74,6 +76,9 @@ curl -u admin:password -X POST "http://localhost:8080/v2/_zot/ext/mgmt/gc?store=
 | 404 | unknown store or repository |
 | 409 | GC is disabled for the store, or GC of the store (or repository) is already running |
 | 503 | GC could not be scheduled, retry later |
+
+Once a request is accepted, the status (see below) reports the run as `running` until it has finished,
+so a client can poll it to wait for the result.
 
 A store sweep which is already running may have collected some repositories before the request,
 so a request made while it runs is rejected with 409 instead of being merged into it: retry once it has finished.

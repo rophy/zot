@@ -197,3 +197,47 @@ func waitFor(cond func() bool, timeout time.Duration) bool {
 
 	return cond()
 }
+
+func TestMgmtGCWithoutAccessControl(t *testing.T) {
+	enable := true
+
+	newConf := func() *config.Config {
+		conf := config.New()
+		conf.HTTP.Port = test.GetFreePort()
+		conf.Storage.RootDirectory = t.TempDir()
+		conf.Storage.GC = true
+		conf.Storage.GCInterval = time.Hour
+		conf.Extensions = &extconf.ExtensionConfig{
+			Search: &extconf.SearchConfig{Enable: &enable},
+			Mgmt:   &extconf.MgmtConfig{Enable: &enable},
+		}
+
+		return conf
+	}
+
+	Convey("Without accessControl every authenticated user is an admin", t, func() {
+		username, password := "user", "user-pass"
+
+		conf := newConf()
+		conf.HTTP.Auth.HTPasswd.Path = test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(username, password))
+
+		ctlrManager := test.NewControllerManager(api.NewController(conf))
+		baseURL := ctlrManager.StartAndWait()
+		defer ctlrManager.StopServer()
+
+		resp, err := resty.R().SetBasicAuth(username, password).SetQueryParam("store", "/").
+			Post(baseURL + constants.FullMgmt + "/gc")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusAccepted)
+	})
+
+	Convey("Without authentication and accessControl anyone is an admin", t, func() {
+		ctlrManager := test.NewControllerManager(api.NewController(newConf()))
+		baseURL := ctlrManager.StartAndWait()
+		defer ctlrManager.StopServer()
+
+		resp, err := resty.R().SetQueryParam("store", "/").Post(baseURL + constants.FullMgmt + "/gc")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusAccepted)
+	})
+}
