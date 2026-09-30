@@ -163,6 +163,152 @@
                 }
             }
         },
+        "/v2/_zot/ext/mgmt/gc": {
+            "get": {
+                "description": "POST starts garbage collection of a store, or of a single repository in it.\nGET returns the status of the current or last run, including what it deleted. Admin only.\nA store sweep is paced like the periodic sweep, and may start outside gcTimeWindow.",
+                "produces": [
+                    "application/json"
+                ],
+                "summary": "Run garbage collection on demand, or get its status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "store route: / for the default store, otherwise a subPaths key",
+                        "name": "store",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "repository name",
+                        "name": "repo",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/gc.RunStatus"
+                        }
+                    },
+                    "202": {
+                        "description": "accepted",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "bad request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "store or repository not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "409": {
+                        "description": "gc disabled for the store, or already running",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "gc could not be scheduled, retry later",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "POST starts garbage collection of a store, or of a single repository in it.\nGET returns the status of the current or last run, including what it deleted. Admin only.\nA store sweep is paced like the periodic sweep, and may start outside gcTimeWindow.",
+                "produces": [
+                    "application/json"
+                ],
+                "summary": "Run garbage collection on demand, or get its status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "store route: / for the default store, otherwise a subPaths key",
+                        "name": "store",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "repository name",
+                        "name": "repo",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/gc.RunStatus"
+                        }
+                    },
+                    "202": {
+                        "description": "accepted",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "bad request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "403": {
+                        "description": "forbidden",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "store or repository not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "409": {
+                        "description": "gc disabled for the store, or already running",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "503": {
+                        "description": "gc could not be scheduled, retry later",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/v2/_zot/ext/notation": {
             "post": {
                 "description": "Upload notation certificates for verifying signatures",
@@ -1502,6 +1648,46 @@
                     }
                 },
                 "releaseTag": {
+                    "type": "string"
+                }
+            }
+        },
+        "gc.DeletedCounts": {
+            "type": "object",
+            "properties": {
+                "blobs": {
+                    "type": "integer"
+                },
+                "manifests": {
+                    "type": "integer"
+                },
+                "uploads": {
+                    "type": "integer"
+                }
+            }
+        },
+        "gc.RunStatus": {
+            "type": "object",
+            "properties": {
+                "deleted": {
+                    "description": "Deleted is what the run deleted so far, from the repositories collected without error.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/gc.DeletedCounts"
+                        }
+                    ]
+                },
+                "error": {
+                    "description": "Error is the last error returned while collecting a repository during the run.",
+                    "type": "string"
+                },
+                "finishedAt": {
+                    "type": "string"
+                },
+                "running": {
+                    "type": "boolean"
+                },
+                "startedAt": {
                     "type": "string"
                 }
             }
