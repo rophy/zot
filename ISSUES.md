@@ -7,7 +7,7 @@ entry once it is merged upstream or dropped.
 
 | # | Issue | Branch | Status |
 | --- | --- | --- | --- |
-| 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`484d3645`) | done and tested; upstream PR not opened |
+| 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`e03da4d8`) | done and tested, rebased on upstream `89465fe1`; reviewed 2026-09-30, status-lag fix and access docs added; waiting for maintainers on #4472 (labeled, no comments), then open the PR |
 | 5 | `TestEventRecorderReload` flaky test fix | `feat/fix-events-reload-test` (`eaf568f4`) | done, passed in staging CI; upstream PR not opened |
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | **on hold until reproduced**: fix done, but the flake is too rare to justify a PR yet (see below) |
 | 7 | Leaked controller in `TestDerivedImageListGqlAuthorization` | none | noticed only: its htpasswd watcher keeps polling a deleted file during later tests |
