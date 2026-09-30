@@ -65,6 +65,27 @@ func TestGarbageCollectOnDemand(t *testing.T) {
 			So(status.FinishedAt.IsZero(), ShouldBeTrue)
 		})
 
+		Convey("a requested sweep is reported as running before the scheduler starts it", func() {
+			onDemand := gc.NewGarbageCollect(imgStore, metaDB, opts, nil, log, metrics).
+				CleanImageStorePeriodically(time.Hour, sch)
+
+			// the scheduler is not running yet, so nothing can have started the sweep
+			So(onDemand.SweepNow(), ShouldBeNil)
+
+			status := onDemand.Status()
+			So(status.Running, ShouldBeTrue)
+			So(status.StartedAt.IsZero(), ShouldBeFalse)
+			So(status.FinishedAt.IsZero(), ShouldBeTrue)
+
+			So(onDemand.SweepNow(), ShouldEqual, zerr.ErrGCAlreadyRunning)
+
+			sch.RunScheduler()
+			defer sch.Shutdown()
+
+			So(waitFor(func() bool { return !onDemand.Status().Running }), ShouldBeTrue)
+			So(onDemand.Status().FinishedAt.IsZero(), ShouldBeFalse)
+		})
+
 		Convey("SweepNow runs a sweep before the interval passes", func() {
 			onDemand := gc.NewGarbageCollect(imgStore, metaDB, opts, nil, log, metrics).
 				CleanImageStorePeriodically(time.Hour, sch)
@@ -182,6 +203,9 @@ func TestGarbageCollectOnDemand(t *testing.T) {
 			sch.Shutdown()
 
 			So(onDemand.SweepNow(), ShouldEqual, zerr.ErrGCNotScheduled)
+
+			// the rejected request does not leave the sweep reported as running
+			So(onDemand.Status().Running, ShouldBeFalse)
 		})
 	})
 }

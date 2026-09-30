@@ -61,7 +61,9 @@ func newOnDemand(gc GarbageCollect, sch *scheduler.Scheduler, gen *GCTaskGenerat
 func (od *OnDemand) SweepNow() error {
 	// The scheduler considers the generator done once it handed out the last repository, while that
 	// repository may still be collected, so check the sweep itself to avoid starting an overlapping sweep.
-	if od.gen.sweep.status().Running {
+	// The sweep is reported as running from now on, not only once the scheduler starts it.
+	previous, requested := od.gen.sweep.request()
+	if !requested {
 		return zerr.ErrGCAlreadyRunning
 	}
 
@@ -69,6 +71,7 @@ func (od *OnDemand) SweepNow() error {
 
 	if !od.sch.RunGeneratorNow(od.gen) {
 		od.gen.forceSweep.Store(false)
+		od.gen.sweep.cancelRequest(previous)
 
 		return zerr.ErrGCNotScheduled
 	}
@@ -163,6 +166,30 @@ func (s *sweepState) start() {
 
 	s.generating = true
 	s.last = RunStatus{Running: true, StartedAt: time.Now()}
+}
+
+// request marks a sweep as running before the scheduler starts it, unless one is already running.
+// It returns the status to restore if the sweep can't be scheduled, and false if a sweep is running.
+func (s *sweepState) request() (RunStatus, bool) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.last.Running {
+		return RunStatus{}, false
+	}
+
+	previous := s.last
+	s.last = RunStatus{Running: true, StartedAt: time.Now()}
+
+	return previous, true
+}
+
+// cancelRequest restores the status from before a request the scheduler did not accept.
+func (s *sweepState) cancelRequest(previous RunStatus) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.last = previous
 }
 
 func (s *sweepState) generationDone() {
