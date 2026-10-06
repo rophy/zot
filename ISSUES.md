@@ -7,7 +7,7 @@ entry once it is merged upstream or dropped.
 
 | # | Issue | Branch | Status |
 | --- | --- | --- | --- |
-| 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`b1922914`), upstream-ready `pr/gc-trigger-api` (`128b252a`, on `main` `84441cd4`), body in `../zot-gc/pr.md` | squashed; 3 CodeRabbit reviews on fork PR rophy/zot#1 (closed) all resolved; deleted counts split off to `feat/gc-status-deleted-counts` as a possible follow-up; waiting for maintainers on #4472, then open the PR |
+| 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`0789d460`), upstream-ready `pr/gc-trigger-api` (`2d592fbc`, on upstream `main` `6bbc7e56`), body in `../zot-gc/pr.md` | squashed; 3 CodeRabbit reviews on fork PR rophy/zot#1 (closed) all resolved; deleted counts split off to `feat/gc-status-deleted-counts` as a possible follow-up; rebased 2026-10-07 (fixed a nil `sweep` panic in upstream test from #4514), upstream PR #4522 opened 2026-10-07 |
 | 5 | `TestEventRecorderReload` flaky test fix | `feat/fix-events-reload-test` (`eaf568f4`) | done, passed in staging CI; upstream PR not opened |
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | **on hold until reproduced**: fix done, but the flake is too rare to justify a PR yet (see below) |
 | 7 | Leaked controller in `TestDerivedImageListGqlAuthorization` | none | noticed only: its htpasswd watcher keeps polling a deleted file during later tests |
