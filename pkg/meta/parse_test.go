@@ -15,6 +15,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
 	docker "github.com/distribution/distribution/v3/manifest/schema2"
+	guuid "github.com/gofrs/uuid"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -452,6 +453,15 @@ func TestParseStorageWithRedisDB(t *testing.T) {
 func TestParseStorageDynamoWrapper(t *testing.T) {
 	tskip.SkipDynamo(t)
 
+	// Unique table names once per test: ResetTable deletes tables; shared fixed names race
+	// with other packages (e.g. pkg/api TestObjectStorageController) under `go test ./...`.
+	// Keep the UUID outside the outer Convey so GoConvey re-runs for nested cases in
+	// RunParseStorageTests reuse one table set instead of creating a new one each time.
+	tableSuffix, err := guuid.NewV4()
+	if err != nil {
+		panic(err)
+	}
+
 	Convey("Dynamodb", t, func() {
 		rootDir := t.TempDir()
 		log := log.NewLogger("debug", "/dev/null")
@@ -459,12 +469,12 @@ func TestParseStorageDynamoWrapper(t *testing.T) {
 		params := dynamodb.DBDriverParameters{
 			Endpoint:               os.Getenv("DYNAMODBMOCK_ENDPOINT"),
 			Region:                 "us-east-2",
-			RepoMetaTablename:      "RepoMetadataTable",
-			RepoBlobsInfoTablename: "RepoBlobsInfoTablename",
-			ImageMetaTablename:     "ImageMetaTablename",
-			UserDataTablename:      "UserDataTable",
-			APIKeyTablename:        "ApiKeyTable",
-			VersionTablename:       "Version",
+			RepoMetaTablename:      "RepoMetadataTable" + tableSuffix.String(),
+			RepoBlobsInfoTablename: "RepoBlobsInfoTablename" + tableSuffix.String(),
+			ImageMetaTablename:     "ImageMetaTablename" + tableSuffix.String(),
+			UserDataTablename:      "UserDataTable" + tableSuffix.String(),
+			APIKeyTablename:        "ApiKeyTable" + tableSuffix.String(),
+			VersionTablename:       "Version" + tableSuffix.String(),
 		}
 
 		dynamoClient, err := dynamodb.GetDynamoClient(params)
@@ -1066,10 +1076,10 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 		So(layers, ShouldBeEmpty)
 	})
 
-	Convey("GetBlobContent errors", t, func() {
+	Convey("signature layer missing from storage", t, func() {
 		mockImageStore := mocks.MockedImageStore{}
-		mockImageStore.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
-			return nil, errMetaTestInjected
+		mockImageStore.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, -1, time.Time{}, errMetaTestInjected
 		}
 		image := CreateRandomImage()
 
@@ -1089,10 +1099,10 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 		So(layers, ShouldBeEmpty)
 	})
 
-	Convey("notation GetBlobContent errors", t, func() {
+	Convey("notation signature layer missing from storage", t, func() {
 		mockImageStore := mocks.MockedImageStore{}
-		mockImageStore.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
-			return nil, errMetaTestInjected
+		mockImageStore.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, -1, time.Time{}, errMetaTestInjected
 		}
 		image := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
 
@@ -1100,6 +1110,21 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 			image.ManifestDescriptor.Data, mockImageStore, log.NewTestLogger())
 		So(err, ShouldNotBeNil)
 		So(layers, ShouldBeEmpty)
+	})
+
+	Convey("signature layers are recorded by digest, their content stays in storage", t, func() {
+		mockImageStore := mocks.MockedImageStore{
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				return nil, errMetaTestInjected
+			},
+		}
+		image := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
+
+		layers, err := meta.GetSignatureLayersInfo("repo", "tag", "123", zcommon.CosignSignature,
+			image.ManifestDescriptor.Data, mockImageStore, log.NewTestLogger())
+		So(err, ShouldBeNil)
+		So(layers, ShouldHaveLength, 1)
+		So(layers[0].LayerDigest, ShouldEqual, image.Manifest.Layers[0].Digest.String())
 	})
 
 	Convey("error while unmarshaling manifest content", t, func() {

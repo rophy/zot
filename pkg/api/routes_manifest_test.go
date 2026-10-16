@@ -6,14 +6,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/regclient/regclient/types/descriptor"
+	"github.com/regclient/regclient/types/manifest"
+	rocispec "github.com/regclient/regclient/types/oci/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -23,16 +30,35 @@ import (
 	ext "zotregistry.dev/zot/v2/pkg/extensions"
 	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
 	syncconf "zotregistry.dev/zot/v2/pkg/extensions/config/sync"
+	"zotregistry.dev/zot/v2/pkg/extensions/sync"
 	"zotregistry.dev/zot/v2/pkg/log"
+	"zotregistry.dev/zot/v2/pkg/storage"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
+	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
+	"zotregistry.dev/zot/v2/pkg/test/storageerrclass"
 )
 
-// Stand-in for a contended redis/redsync lock error from UpdateStatsOnDownload.
-var errStatsLockContention = errors.New("failed to acquire redis lock")
+var (
+	// Stand-in for a contended redis/redsync lock error from UpdateStatsOnDownload.
+	errStatsLockContention = errors.New("failed to acquire redis lock")
+	errStorageInjected     = errors.New("injected storage failure")
+)
+
+// Stand-in for an on-demand sync failure reaching upstream.
+var errUpstreamUnreachable = errors.New("upstream unreachable")
 
 type mockSyncOnDemand struct {
 	syncImageFn                   func(ctx context.Context, repo, reference string) error
+	syncReferrersFn               func(ctx context.Context, repo, subjectDigestStr string, referenceTypes []string) error
 	shouldCheckUpstreamManifestFn func(repo, reference string) bool
+	fetchManifestForStreamFn      func(ctx context.Context, repo, reference string) (manifest.Manifest, error)
+	isStreamingEnabledForRepoFn   func(repo string) bool
+	shouldQueueOnDemandSyncFn     func(repo string) bool
+	// onStreamSynced records the callback the last FetchManifestForStream call was given.
+	onStreamSynced func(manifest.Manifest)
+	streamManager  sync.StreamManager
 }
 
 func (m *mockSyncOnDemand) SyncImage(ctx context.Context, repo, reference string) error {
@@ -43,7 +69,12 @@ func (m *mockSyncOnDemand) SyncImage(ctx context.Context, repo, reference string
 	return nil
 }
 
-func (m *mockSyncOnDemand) SyncReferrers(_ context.Context, _, _ string, _ []string) error {
+func (m *mockSyncOnDemand) SyncReferrers(ctx context.Context, repo, subjectDigestStr string, referenceTypes []string,
+) error {
+	if m.syncReferrersFn != nil {
+		return m.syncReferrersFn(ctx, repo, subjectDigestStr, referenceTypes)
+	}
+
 	return nil
 }
 
@@ -55,16 +86,44 @@ func (m *mockSyncOnDemand) ShouldCheckUpstreamManifest(repo, reference string) b
 	return true
 }
 
-func (m *mockSyncOnDemand) ShouldQueueOnDemandSync(string) bool {
+func (m *mockSyncOnDemand) ShouldQueueOnDemandSync(repo string) bool {
+	if m.shouldQueueOnDemandSyncFn != nil {
+		return m.shouldQueueOnDemandSyncFn(repo)
+	}
+
 	return false
 }
 
 func (m *mockSyncOnDemand) QueueImage(context.Context, string, string) {}
+func (m *mockSyncOnDemand) FetchManifestForStream(ctx context.Context, repo, reference string,
+	onSynced func(manifest.Manifest),
+) (manifest.Manifest, error) {
+	m.onStreamSynced = onSynced
+
+	if m.fetchManifestForStreamFn != nil {
+		return m.fetchManifestForStreamFn(ctx, repo, reference)
+	}
+
+	return nil, zerr.ErrManifestNotFound
+}
+
+func (m *mockSyncOnDemand) IsStreamingEnabledForRepo(repo string) bool {
+	if m.isStreamingEnabledForRepoFn != nil {
+		return m.isStreamingEnabledForRepoFn(repo)
+	}
+
+	return false
+}
+
+func (m *mockSyncOnDemand) StreamManager() sync.StreamManager {
+	return m.streamManager
+}
 
 func newSyncTestRouteHandler(
 	t *testing.T,
 	store mocks.MockedImageStore,
 	syncOnDemand ext.SyncOnDemand,
+	configure ...func(*config.Config),
 ) *api.RouteHandler {
 	t.Helper()
 
@@ -75,10 +134,127 @@ func newSyncTestRouteHandler(
 	ctlr.Config.Extensions = &extconf.ExtensionConfig{
 		Sync: &syncconf.Config{Enable: &trueVal},
 	}
+
+	for _, fn := range configure {
+		fn(ctlr.Config)
+	}
 	ctlr.StoreController.DefaultStore = store
 	ctlr.SyncOnDemand = syncOnDemand
 
 	return api.NewRouteHandler(ctlr)
+}
+
+func TestListTagsStorageErrors(t *testing.T) {
+	Convey("ListTags maps storage classes without collapsing outages to NAME_UNKNOWN", t, func() {
+		runCase := func(tagsErr error) int {
+			ctlr := api.NewController(config.New())
+			ctlr.Router = mux.NewRouter()
+			ctlr.StoreController.DefaultStore = mocks.MockedImageStore{
+				GetImageTagsFn: func(_ string) ([]string, error) {
+					return nil, tagsErr
+				},
+			}
+
+			handler := api.NewRouteHandler(ctlr)
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://example.com/v2/test/tags/list",
+				http.NoBody,
+			)
+			req = mux.SetURLVars(req, map[string]string{"name": "test"})
+
+			rec := httptest.NewRecorder()
+			handler.ListTags(rec, req)
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			return resp.StatusCode
+		}
+
+		Convey("ErrRepoNotFound → 404", func() {
+			So(runCase(zerr.ErrRepoNotFound), ShouldEqual, http.StatusNotFound)
+		})
+
+		Convey("ErrStorageTransient → 503 (not NAME_UNKNOWN 404)", func() {
+			So(runCase(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+		})
+
+		Convey("ErrStoragePermanent → 500 (not NAME_UNKNOWN 404)", func() {
+			So(runCase(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+	})
+}
+
+func TestUpdateManifestStorageErrorsSkipCleanup(t *testing.T) {
+	Convey("UpdateManifest does not delete an existing reference on PutImageManifest errors", t, func() {
+		const (
+			repo      = "test"
+			reference = "v1.0"
+		)
+
+		manifestBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`)
+
+		newReq := func() *http.Request {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodPut,
+				"http://example.com/v2/"+repo+"/manifests/"+reference,
+				bytes.NewReader(manifestBody),
+			)
+			req.Header.Set("Content-Type", ispec.MediaTypeImageManifest)
+
+			return mux.SetURLVars(req, map[string]string{
+				"name":      repo,
+				"reference": reference,
+			})
+		}
+
+		runCase := func(putErr error) (int, int) {
+			deleteCalls := 0
+			ctlr := api.NewController(config.New())
+			ctlr.Router = mux.NewRouter()
+			ctlr.StoreController.DefaultStore = mocks.MockedImageStore{
+				PutImageManifestFn: func(_ context.Context, _, _, _ string, _ []byte, _ []string,
+				) (godigest.Digest, godigest.Digest, error) {
+					return "", "", putErr
+				},
+				DeleteImageManifestFn: func(_ context.Context, _, _ string, _ bool) error {
+					deleteCalls++
+
+					return nil
+				},
+			}
+
+			handler := api.NewRouteHandler(ctlr)
+			rec := httptest.NewRecorder()
+			handler.UpdateManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			return resp.StatusCode, deleteCalls
+		}
+
+		Convey("ErrStorageTransient returns 503 without DeleteImageManifest", func() {
+			status, deletes := runCase(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(deletes, ShouldEqual, 0)
+		})
+
+		Convey("ErrStoragePermanent returns 500 without DeleteImageManifest", func() {
+			status, deletes := runCase(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(deletes, ShouldEqual, 0)
+		})
+
+		Convey("unrecognized pre-commit errors return 500 without DeleteImageManifest", func() {
+			status, deletes := runCase(io.ErrShortWrite)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(deletes, ShouldEqual, 0)
+		})
+	})
 }
 
 func TestGetManifestServesDespiteStatsError(t *testing.T) {
@@ -261,6 +437,1030 @@ func TestGetManifestCheckInterval(t *testing.T) {
 
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
 			So(syncCalls, ShouldEqual, 1)
+		})
+	})
+}
+
+func TestGetManifestOnDemandSyncErrors(t *testing.T) {
+	Convey("GetManifest maps opaque sync sentinels only when the cache is empty", t, func() {
+		const reference = "v1.0"
+
+		newReq := func() *http.Request {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://example.com/v2/test/manifests/"+reference,
+				http.NoBody,
+			)
+
+			return mux.SetURLVars(req, map[string]string{
+				"name":      "test",
+				"reference": reference,
+			})
+		}
+
+		Convey("serves a cached manifest when the upstream refresh fails", func() {
+			localManifest := []byte(`{"schemaVersion":2}`)
+			localDigest := godigest.FromBytes(localManifest)
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return localManifest, localDigest, ispec.MediaTypeImageManifest, nil
+				},
+			}, &mockSyncOnDemand{
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					return zerr.ErrSyncInternal
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			body, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+			So(strings.TrimSpace(string(body)), ShouldEqual, string(localManifest))
+		})
+
+		Convey("keeps 404 when sync only reports a content-filter miss", func() {
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrManifestNotFound
+				},
+			}, &mockSyncOnDemand{
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					return zerr.ErrSyncImageFilteredOut
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusNotFound)
+		})
+
+		Convey("prefers a local storage error over a sync failure", func() {
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrStoragePermanent
+				},
+			}, &mockSyncOnDemand{
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					return zerr.ErrSyncInternal
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("returns 503 when sync reports an internal failure", func() {
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrManifestNotFound
+				},
+			}, &mockSyncOnDemand{
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					return zerr.ErrSyncInternal
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			body, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
+			So(string(body), ShouldContainSubstring, zerr.ErrSyncInternal.Error())
+		})
+	})
+}
+
+func TestCheckManifestOnDemandSyncErrors(t *testing.T) {
+	Convey("CheckManifest maps opaque sync sentinels only when the cache is empty", t, func() {
+		const reference = "v1.0"
+
+		newReq := func() *http.Request {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodHead,
+				"http://example.com/v2/test/manifests/"+reference,
+				http.NoBody,
+			)
+
+			return mux.SetURLVars(req, map[string]string{
+				"name":      "test",
+				"reference": reference,
+			})
+		}
+
+		Convey("returns 503 when sync reports an internal failure", func() {
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrManifestNotFound
+				},
+			}, &mockSyncOnDemand{
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					return zerr.ErrSyncInternal
+				},
+			})
+
+			rec := httptest.NewRecorder()
+			handler.CheckManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			body, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
+			So(string(body), ShouldContainSubstring, zerr.ErrSyncInternal.Error())
+		})
+	})
+}
+
+func TestHTTPStorageClassStatusMapping(t *testing.T) {
+	Convey("direct storage Transient → 503, Permanent → 500, never 404-shaped codes", t, func() {
+		const (
+			repo        = "test"
+			validDigest = "sha256:7b8437f04f83f084b7ed68ad8c4a4947e12fc4e1b006b38129bac89114ec3621"
+			sessionID   = "upload-session"
+			reference   = "v1.0"
+		)
+
+		newHandler := func(store mocks.MockedImageStore) *api.RouteHandler {
+			ctlr := api.NewController(config.New())
+			ctlr.Router = mux.NewRouter()
+			ctlr.StoreController.DefaultStore = store
+
+			return api.NewRouteHandler(ctlr)
+		}
+
+		Convey("CheckBlob", func() {
+			run := func(statErr error) (int, string) {
+				handler := newHandler(mocks.MockedImageStore{
+					StatBlobFn: func(_ string, _ godigest.Digest) (bool, int64, time.Time, error) {
+						return false, -1, time.Time{}, statErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodHead,
+					"http://example.com/v2/"+repo+"/blobs/"+validDigest, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "digest": validDigest})
+				rec := httptest.NewRecorder()
+				handler.CheckBlob(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				return resp.StatusCode, string(body)
+			}
+
+			status, body := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(body, ShouldNotContainSubstring, "BLOB_UNKNOWN")
+
+			status, body = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(body, ShouldNotContainSubstring, "BLOB_UNKNOWN")
+
+			status, body = run(zerr.ErrBlobNotFound)
+			So(status, ShouldEqual, http.StatusNotFound)
+			So(body, ShouldContainSubstring, "BLOB_UNKNOWN")
+		})
+
+		Convey("GetBlob", func() {
+			run := func(getErr error) (int, string) {
+				handler := newHandler(mocks.MockedImageStore{
+					GetBlobFn: func(_ string, _ godigest.Digest, _ string) (io.ReadCloser, int64, error) {
+						return nil, -1, getErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+					"http://example.com/v2/"+repo+"/blobs/"+validDigest, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "digest": validDigest})
+				rec := httptest.NewRecorder()
+				handler.GetBlob(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				return resp.StatusCode, string(body)
+			}
+
+			status, body := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(body, ShouldNotContainSubstring, "BLOB_UNKNOWN")
+
+			status, body = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(body, ShouldNotContainSubstring, "BLOB_UNKNOWN")
+		})
+
+		Convey("CreateBlobUpload", func() {
+			run := func(newErr error) (int, string) {
+				handler := newHandler(mocks.MockedImageStore{
+					NewBlobUploadFn: func(_ context.Context, _ string) (string, error) {
+						return "", newErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
+					"http://example.com/v2/"+repo+"/blobs/uploads/", http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo})
+				rec := httptest.NewRecorder()
+				handler.CreateBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				return resp.StatusCode, string(body)
+			}
+
+			status, body := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(body, ShouldNotContainSubstring, "NAME_UNKNOWN")
+
+			status, body = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(body, ShouldNotContainSubstring, "NAME_UNKNOWN")
+		})
+
+		Convey("UpdateBlobUpload FinishBlobUpload", func() {
+			run := func(finishErr error) (int, string, bool) {
+				deleted := false
+				handler := newHandler(mocks.MockedImageStore{
+					FinishBlobUploadFn: func(_ string, _ string, _ io.Reader, _ godigest.Digest) error {
+						return finishErr
+					},
+					DeleteBlobUploadFn: func(_, _ string) error {
+						deleted = true
+
+						return nil
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodPut,
+					"http://example.com/v2/"+repo+"/blobs/uploads/"+sessionID+"?digest="+validDigest,
+					http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "session_id": sessionID})
+				q := req.URL.Query()
+				q.Set("digest", validDigest)
+				req.URL.RawQuery = q.Encode()
+				rec := httptest.NewRecorder()
+				handler.UpdateBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				return resp.StatusCode, string(body), deleted
+			}
+
+			status, body, deleted := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(body, ShouldNotContainSubstring, "BLOB_UPLOAD_UNKNOWN")
+			So(deleted, ShouldBeFalse)
+
+			status, body, deleted = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(body, ShouldNotContainSubstring, "BLOB_UPLOAD_UNKNOWN")
+			So(deleted, ShouldBeTrue)
+		})
+
+		Convey("CheckManifest / GetManifest local Transient without MANIFEST_INVALID", func() {
+			store := mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrStorageTransient
+				},
+			}
+			handler := newHandler(store)
+
+			for _, method := range []string{http.MethodHead, http.MethodGet} {
+				req := httptest.NewRequestWithContext(context.Background(), method,
+					"http://example.com/v2/"+repo+"/manifests/"+reference, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "reference": reference})
+				rec := httptest.NewRecorder()
+				if method == http.MethodHead {
+					handler.CheckManifest(rec, req)
+				} else {
+					handler.GetManifest(rec, req)
+				}
+				resp := rec.Result()
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
+				So(string(body), ShouldNotContainSubstring, "MANIFEST_INVALID")
+				So(string(body), ShouldNotContainSubstring, "MANIFEST_UNKNOWN")
+			}
+
+			handler = newHandler(mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", zerr.ErrStoragePermanent
+				},
+			})
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+				"http://example.com/v2/"+repo+"/manifests/"+reference, http.NoBody)
+			req = mux.SetURLVars(req, map[string]string{"name": repo, "reference": reference})
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, req)
+			resp := rec.Result()
+			defer resp.Body.Close()
+			So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("CheckManifest unrecognized error → 500", func() {
+			handler := newHandler(mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return nil, "", "", errors.New("unexpected manifest failure") //nolint:err113 // test
+				},
+			})
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodHead,
+				"http://example.com/v2/"+repo+"/manifests/"+reference, http.NoBody)
+			req = mux.SetURLVars(req, map[string]string{"name": repo, "reference": reference})
+			rec := httptest.NewRecorder()
+			handler.CheckManifest(rec, req)
+			resp := rec.Result()
+			defer resp.Body.Close()
+			So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("DeleteManifest", func() {
+			run := func(getErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+						return nil, "", "", getErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete,
+					"http://example.com/v2/"+repo+"/manifests/"+reference, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "reference": reference})
+				rec := httptest.NewRecorder()
+				handler.DeleteManifest(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("DeleteManifest delete arm Transient/Permanent", func() {
+			run := func(deleteErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+						return []byte(`{}`), godigest.Digest(validDigest), ispec.MediaTypeImageManifest, nil
+					},
+					DeleteImageManifestFn: func(_ context.Context, _ string, _ string, _ bool) error {
+						return deleteErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete,
+					"http://example.com/v2/"+repo+"/manifests/"+reference, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "reference": reference})
+				rec := httptest.NewRecorder()
+				handler.DeleteManifest(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("DeleteBlob", func() {
+			run := func(deleteErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					DeleteBlobFn: func(_ string, _ godigest.Digest) error {
+						return deleteErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete,
+					"http://example.com/v2/"+repo+"/blobs/"+validDigest, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "digest": validDigest})
+				rec := httptest.NewRecorder()
+				handler.DeleteBlob(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("CreateBlobUpload FullBlobUpload Transient/Permanent", func() {
+			run := func(uploadErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					FullBlobUploadFn: func(_ context.Context, _ string, _ io.Reader, _ godigest.Digest,
+					) (string, int64, error) {
+						return "", -1, uploadErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
+					"http://example.com/v2/"+repo+"/blobs/uploads/?digest="+validDigest,
+					bytes.NewReader([]byte("blob")))
+				req = mux.SetURLVars(req, map[string]string{"name": repo})
+				req.Header.Set("Content-Type", constants.BinaryMediaType)
+				req.ContentLength = 4
+				rec := httptest.NewRecorder()
+				handler.CreateBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("GetBlobUpload Transient/Permanent", func() {
+			run := func(getErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					GetBlobUploadFn: func(_, _ string) (int64, error) {
+						return -1, getErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+					"http://example.com/v2/"+repo+"/blobs/uploads/"+sessionID, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "session_id": sessionID})
+				rec := httptest.NewRecorder()
+				handler.GetBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("PatchBlobUpload streamed Transient/Permanent", func() {
+			run := func(patchErr error) (int, bool) {
+				deleted := false
+				handler := newHandler(mocks.MockedImageStore{
+					PutBlobChunkStreamedFn: func(_ context.Context, _, _ string, _ io.Reader) (int64, error) {
+						return -1, patchErr
+					},
+					DeleteBlobUploadFn: func(_, _ string) error {
+						deleted = true
+
+						return nil
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodPatch,
+					"http://example.com/v2/"+repo+"/blobs/uploads/"+sessionID,
+					bytes.NewReader([]byte("chunk")))
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "session_id": sessionID})
+				rec := httptest.NewRecorder()
+				handler.PatchBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode, deleted
+			}
+
+			status, deleted := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(deleted, ShouldBeFalse)
+
+			status, deleted = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(deleted, ShouldBeTrue)
+		})
+
+		Convey("UpdateBlobUpload PutBlobChunk Transient/Permanent", func() {
+			run := func(chunkErr error) (int, bool) {
+				deleted := false
+				handler := newHandler(mocks.MockedImageStore{
+					PutBlobChunkFn: func(_ context.Context, _, _ string, _, _ int64, _ io.Reader) (int64, error) {
+						return -1, chunkErr
+					},
+					DeleteBlobUploadFn: func(_, _ string) error {
+						deleted = true
+
+						return nil
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodPut,
+					"http://example.com/v2/"+repo+"/blobs/uploads/"+sessionID+"?digest="+validDigest,
+					bytes.NewReader([]byte("x")))
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "session_id": sessionID})
+				req.Header.Set("Content-Length", "1")
+				rec := httptest.NewRecorder()
+				handler.UpdateBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode, deleted
+			}
+
+			status, deleted := run(zerr.ErrStorageTransient)
+			So(status, ShouldEqual, http.StatusServiceUnavailable)
+			So(deleted, ShouldBeFalse)
+
+			status, deleted = run(zerr.ErrStoragePermanent)
+			So(status, ShouldEqual, http.StatusInternalServerError)
+			So(deleted, ShouldBeTrue)
+		})
+
+		Convey("DeleteBlobUpload Transient/Permanent", func() {
+			run := func(deleteErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					DeleteBlobUploadFn: func(_, _ string) error {
+						return deleteErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete,
+					"http://example.com/v2/"+repo+"/blobs/uploads/"+sessionID, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "session_id": sessionID})
+				rec := httptest.NewRecorder()
+				handler.DeleteBlobUpload(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("GetReferrers", func() {
+			run := func(refErr error) int {
+				handler := newHandler(mocks.MockedImageStore{
+					GetReferrersFn: func(_ string, _ godigest.Digest, _ []string) (ispec.Index, error) {
+						return ispec.Index{}, refErr
+					},
+				})
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+					"http://example.com/v2/"+repo+"/referrers/"+validDigest, http.NoBody)
+				req = mux.SetURLVars(req, map[string]string{"name": repo, "digest": validDigest})
+				rec := httptest.NewRecorder()
+				handler.GetReferrers(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+
+				return resp.StatusCode
+			}
+
+			So(run(zerr.ErrStorageTransient), ShouldEqual, http.StatusServiceUnavailable)
+			So(run(zerr.ErrStoragePermanent), ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("ListRepositories Walk-level Transient → 503; soft-skip path stays 200", func() {
+			handler := newHandler(mocks.MockedImageStore{
+				GetNextRepositoriesFn: func(_ string, _ int, _ storageTypes.FilterRepoFunc,
+				) ([]string, bool, error) {
+					return nil, false, zerr.ErrStorageTransient
+				},
+			})
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+				"http://example.com/v2/_catalog", http.NoBody)
+			rec := httptest.NewRecorder()
+			handler.ListRepositories(rec, req)
+			resp := rec.Result()
+			defer resp.Body.Close()
+			So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
+
+			handler = newHandler(mocks.MockedImageStore{
+				GetNextRepositoriesFn: func(_ string, _ int, _ storageTypes.FilterRepoFunc,
+				) ([]string, bool, error) {
+					return []string{"kept"}, false, nil
+				},
+			})
+			req = httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+				"http://example.com/v2/_catalog", http.NoBody)
+			rec = httptest.NewRecorder()
+			handler.ListRepositories(rec, req)
+			resp = rec.Result()
+			defer resp.Body.Close()
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("ListRepositories on a real local store with injected storage failures", func() {
+			imgStore, hooks := storageerrclass.NewStore(t, storageerrclass.Local())
+			storeController := storage.StoreController{DefaultStore: imgStore}
+
+			for _, name := range []string{"a/repo", "b", "c/repo"} {
+				So(WriteImageToFileSystem(CreateRandomImage(), name, "v1", storeController), ShouldBeNil)
+			}
+
+			ctlr := api.NewController(config.New())
+			ctlr.Router = mux.NewRouter()
+			ctlr.StoreController.DefaultStore = imgStore
+			handler := api.NewRouteHandler(ctlr)
+
+			listCatalog := func() (int, string) {
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+					"http://example.com/v2/_catalog", http.NoBody)
+				rec := httptest.NewRecorder()
+				handler.ListRepositories(rec, req)
+				resp := rec.Result()
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				return resp.StatusCode, string(body)
+			}
+
+			Convey("a Transient root walk is 503", func() {
+				hooks.AddFault(storageerrclass.Fault{
+					Op: storageerrclass.OpWalk, Path: imgStore.RootDir(), Err: errclass.MarkTransient(errStorageInjected),
+				})
+
+				status, _ := listCatalog()
+				So(status, ShouldEqual, http.StatusServiceUnavailable)
+			})
+
+			Convey("a Permanent root walk is 500", func() {
+				hooks.AddFault(storageerrclass.Fault{
+					Op: storageerrclass.OpWalk, Path: imgStore.RootDir(), Err: errclass.MarkPermanent(errStorageInjected),
+				})
+
+				status, _ := listCatalog()
+				So(status, ShouldEqual, http.StatusInternalServerError)
+			})
+
+			Convey("a Transient failure validating one repository is a partial 200", func() {
+				hooks.AddFault(storageerrclass.Fault{
+					Op: storageerrclass.OpList, Path: path.Join(imgStore.RootDir(), "b"),
+					Err: errclass.MarkTransient(errStorageInjected),
+				})
+
+				status, body := listCatalog()
+				So(status, ShouldEqual, http.StatusOK)
+				So(body, ShouldContainSubstring, `"a/repo"`)
+				So(body, ShouldContainSubstring, `"c/repo"`)
+				So(body, ShouldNotContainSubstring, `"b"`)
+			})
+		})
+	})
+}
+
+func TestGetManifestStreaming(t *testing.T) {
+	Convey("GetManifest fetches directly from upstream for a streaming-enabled repo", t, func() {
+		const reference = "v1.0"
+
+		newReq := func() *http.Request {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://example.com/v2/test/manifests/"+reference,
+				http.NoBody,
+			)
+
+			return mux.SetURLVars(req, map[string]string{
+				"name":      "test",
+				"reference": reference,
+			})
+		}
+
+		// manifest.New only accepts regclient's own OCI types, not image-spec's ispec.Manifest.
+		upstreamManifest := rocispec.Manifest{
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
+			Config: descriptor.Descriptor{
+				MediaType: ispec.MediaTypeEmptyJSON,
+				Digest:    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+				Size:      2,
+				Data:      []byte(`{}`),
+			},
+		}
+
+		man, err := manifest.New(manifest.WithOrig(upstreamManifest))
+		So(err, ShouldBeNil)
+
+		body, err := man.RawBody()
+		So(err, ShouldBeNil)
+
+		notFoundStore := mocks.MockedImageStore{
+			GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+				return nil, "", "", zerr.ErrManifestNotFound
+			},
+		}
+
+		Convey("returns the upstream manifest directly, without calling SyncImage", func() {
+			syncCalls := 0
+
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				fetchManifestForStreamFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return man, nil
+				},
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					syncCalls++
+
+					return nil
+				},
+			}
+			handler := newSyncTestRouteHandler(t, notFoundStore, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, man.GetDescriptor().Digest.String())
+
+			respBody, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(respBody, ShouldResemble, body)
+
+			So(syncCalls, ShouldEqual, 0)
+		})
+
+		Convey("only GET registers a download-count callback for the background sync", func() {
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				fetchManifestForStreamFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return man, nil
+				},
+			}
+			handler := newSyncTestRouteHandler(t, notFoundStore, syncOnDemand)
+
+			headReq := newReq()
+			headReq.Method = http.MethodHead
+
+			headRec := httptest.NewRecorder()
+			handler.CheckManifest(headRec, headReq)
+
+			headResp := headRec.Result()
+			defer headResp.Body.Close()
+
+			So(headResp.StatusCode, ShouldEqual, http.StatusOK)
+			So(syncOnDemand.onStreamSynced, ShouldBeNil)
+
+			getRec := httptest.NewRecorder()
+			handler.GetManifest(getRec, newReq())
+
+			getResp := getRec.Result()
+			defer getResp.Body.Close()
+
+			So(getResp.StatusCode, ShouldEqual, http.StatusOK)
+			So(syncOnDemand.onStreamSynced, ShouldNotBeNil)
+		})
+
+		Convey("falls back to a non-streaming on-demand sync when FetchManifestForStream fails before syncing", func() {
+			// E.g. no stream manager: FetchManifestForStream ran no sync, so the route runs the
+			// plain one, which commits the image locally.
+			syncCalls := 0
+
+			localStore := mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					if syncCalls == 0 {
+						return nil, "", "", zerr.ErrManifestNotFound
+					}
+
+					return body, man.GetDescriptor().Digest, man.GetDescriptor().MediaType, nil
+				},
+			}
+
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				fetchManifestForStreamFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return nil, zerr.ErrStreamManagerNotInitialized
+				},
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					syncCalls++
+
+					return nil
+				},
+			}
+			handler := newSyncTestRouteHandler(t, localStore, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(syncCalls, ShouldEqual, 1)
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+
+			respBody, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(respBody, ShouldResemble, body)
+		})
+
+		Convey("serves from storage, without a second sync, when the image was synced without streaming", func() {
+			// E.g. an index, the stream cap, or another sync already in flight: FetchManifestForStream
+			// has already waited for the one on-demand sync.
+			localStore := mocks.MockedImageStore{
+				GetImageManifestFn: func(_ string, _ string) ([]byte, godigest.Digest, string, error) {
+					return body, man.GetDescriptor().Digest, man.GetDescriptor().MediaType, nil
+				},
+			}
+
+			syncCalls := 0
+
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				fetchManifestForStreamFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+					return nil, zerr.ErrSyncNotStreamed
+				},
+				syncImageFn: func(_ context.Context, _, _ string) error {
+					syncCalls++
+
+					return nil
+				},
+			}
+			handler := newSyncTestRouteHandler(t, localStore, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetManifest(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(syncCalls, ShouldEqual, 0)
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+
+			respBody, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(respBody, ShouldResemble, body)
+		})
+
+		Convey("maps a failed not-streamed sync like a non-streaming one", func() {
+			// A hard failure is a 503, a soft miss stays a 404.
+			for _, testCase := range []struct {
+				syncErr error
+				status  int
+			}{
+				{zerr.ErrSyncInternal, http.StatusServiceUnavailable},
+				{zerr.ErrSyncImageFilteredOut, http.StatusNotFound},
+			} {
+				syncCalls := 0
+
+				syncOnDemand := &mockSyncOnDemand{
+					isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+					fetchManifestForStreamFn: func(_ context.Context, _, _ string) (manifest.Manifest, error) {
+						return nil, fmt.Errorf("%w: %w", zerr.ErrSyncNotStreamed, testCase.syncErr)
+					},
+					syncImageFn: func(_ context.Context, _, _ string) error {
+						syncCalls++
+
+						return nil
+					},
+				}
+				handler := newSyncTestRouteHandler(t, notFoundStore, syncOnDemand)
+
+				rec := httptest.NewRecorder()
+				handler.GetManifest(rec, newReq())
+
+				resp := rec.Result()
+				_ = resp.Body.Close()
+
+				So(syncCalls, ShouldEqual, 0)
+				So(resp.StatusCode, ShouldEqual, testCase.status)
+			}
+		})
+	})
+}
+
+func TestGetReferrers(t *testing.T) {
+	Convey("GetReferrers", t, func() {
+		const digest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+
+		newReq := func() *http.Request {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://example.com/v2/test/referrers/"+digest,
+				http.NoBody,
+			)
+
+			return mux.SetURLVars(req, map[string]string{
+				"name":   "test",
+				"digest": digest,
+			})
+		}
+
+		referrers := ispec.Index{MediaType: ispec.MediaTypeImageIndex}
+
+		Convey("syncs referrers on demand before reading the local store when sync is enabled", func() {
+			var syncedRepo, syncedDigest string
+
+			syncOnDemand := &mockSyncOnDemand{
+				syncReferrersFn: func(_ context.Context, repo, subjectDigest string, _ []string) error {
+					syncedRepo = repo
+					syncedDigest = subjectDigest
+
+					return nil
+				},
+			}
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetReferrersFn: func(_ string, _ godigest.Digest, _ []string) (ispec.Index, error) {
+					return referrers, nil
+				},
+			}, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetReferrers(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+			So(syncedRepo, ShouldEqual, "test")
+			So(syncedDigest, ShouldEqual, digest)
+		})
+
+		Convey("still serves the local store's referrers when the on-demand sync fails", func() {
+			syncOnDemand := &mockSyncOnDemand{
+				syncReferrersFn: func(_ context.Context, _, _ string, _ []string) error {
+					return errUpstreamUnreachable
+				},
+			}
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetReferrersFn: func(_ string, _ godigest.Digest, _ []string) (ispec.Index, error) {
+					return referrers, nil
+				},
+			}, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetReferrers(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("does not sync when sync-on-demand is disabled", func() {
+			ctlr := api.NewController(config.New())
+			ctlr.Router = mux.NewRouter()
+			ctlr.StoreController.DefaultStore = mocks.MockedImageStore{
+				GetReferrersFn: func(_ string, _ godigest.Digest, _ []string) (ispec.Index, error) {
+					return referrers, nil
+				},
+			}
+			// SyncOnDemand and Extensions.Sync left unset: isSyncOnDemandEnabled must gate on this
+			// rather than call a nil SyncOnDemand.
+			handler := api.NewRouteHandler(ctlr)
+
+			rec := httptest.NewRecorder()
+			handler.GetReferrers(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("returns 404 when the subject manifest is unknown", func() {
+			syncOnDemand := &mockSyncOnDemand{}
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{
+				GetReferrersFn: func(_ string, _ godigest.Digest, _ []string) (ispec.Index, error) {
+					return ispec.Index{}, zerr.ErrManifestNotFound
+				},
+			}, syncOnDemand)
+
+			rec := httptest.NewRecorder()
+			handler.GetReferrers(rec, newReq())
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusNotFound)
+		})
+
+		Convey("returns 400 for an invalid digest", func() {
+			syncOnDemand := &mockSyncOnDemand{}
+			handler := newSyncTestRouteHandler(t, mocks.MockedImageStore{}, syncOnDemand)
+
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodGet,
+				"http://example.com/v2/test/referrers/not-a-digest",
+				http.NoBody,
+			)
+			req = mux.SetURLVars(req, map[string]string{"name": "test", "digest": "not-a-digest"})
+
+			rec := httptest.NewRecorder()
+			handler.GetReferrers(rec, req)
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusBadRequest)
 		})
 	})
 }

@@ -5,21 +5,12 @@ package gcs_test
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
-	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"slices"
@@ -28,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
 	guuid "github.com/gofrs/uuid"
@@ -37,6 +29,7 @@ import (
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
+	rediscfg "zotregistry.dev/zot/v2/pkg/api/config/redis"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
 	"zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/storage"
@@ -46,6 +39,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/storage/gc"
 	"zotregistry.dev/zot/v2/pkg/storage/gcs"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
+	"zotregistry.dev/zot/v2/pkg/test/gcsemulator"
 	. "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 	tskip "zotregistry.dev/zot/v2/pkg/test/skip"
@@ -64,299 +58,9 @@ var (
 	errBucketCreateFailed         = errors.New("failed to create bucket")
 )
 
-// httpsProxyServer manages an HTTPS proxy server on port 443.
-type httpsProxyServer struct {
-	server   *http.Server
-	listener net.Listener
-	wg       sync.WaitGroup
-	target   string
-	certFile string // Path to the certificate file for cleanup
-}
-
-// newHTTPSProxyServer creates a new HTTPS proxy server that forwards requests to the target.
-func newHTTPSProxyServer(target string) (*httpsProxyServer, error) {
-	// Generate self-signed certificate
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate private key: %w", err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: "oauth2.googleapis.com",
-		},
-		NotBefore:   time.Now(),
-		NotAfter:    time.Now().Add(24 * time.Hour),
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:    []string{"oauth2.googleapis.com", "www.googleapis.com", "storage.googleapis.com"},
-		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create certificate: %w", err)
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create key pair: %w", err)
-	}
-
-	// Write certificate to a temporary file so we can add it to the trusted certificates
-	// via SSL_CERT_FILE environment variable. This is the standard way to add custom
-	// trusted certificates and works with Go's crypto/x509 package, including OAuth2 clients.
-	certFile, err := os.CreateTemp("", "gcs-test-cert-*.pem")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp cert file: %w", err)
-	}
-	if _, err := certFile.Write(certPEM); err != nil {
-		certFile.Close()
-		os.Remove(certFile.Name())
-
-		return nil, fmt.Errorf("failed to write cert to file: %w", err)
-	}
-
-	if err := certFile.Close(); err != nil {
-		os.Remove(certFile.Name())
-
-		return nil, fmt.Errorf("failed to close cert file: %w", err)
-	}
-
-	// Create proxy handler
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Build target URL
-		targetURL := target + r.URL.Path
-		if r.URL.RawQuery != "" {
-			targetURL += "?" + r.URL.RawQuery
-		}
-
-		// Create request to target.
-		//nolint:gosec // proxy target is local test server
-		req, err := http.NewRequestWithContext(
-			r.Context(),
-			r.Method,
-			targetURL,
-			r.Body,
-		)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-
-			return
-		}
-
-		// Copy headers
-		for key, values := range r.Header {
-			if key != "Host" && key != "Connection" {
-				for _, value := range values {
-					req.Header.Add(key, value)
-				}
-			}
-		}
-
-		// Make request
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req) //nolint:gosec // request is sent to local test server
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-
-			return
-		}
-		defer resp.Body.Close()
-
-		// Copy response headers
-		for key, values := range resp.Header {
-			if key != "Connection" && key != "Transfer-Encoding" {
-				for _, value := range values {
-					w.Header().Add(key, value)
-				}
-			}
-		}
-
-		// Copy status and body
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-	})
-
-	// Create HTTP server with TLS config (test-only proxy).
-	server := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		},
-	}
-
-	// Try to listen on port 443 (requires root or CAP_NET_BIND_SERVICE for tests).
-	lc := net.ListenConfig{}
-	listener, err := lc.Listen(context.Background(), "tcp", ":443") //nolint:gosec // G102: test proxy must listen on 443
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on port 443: %w (may require root or CAP_NET_BIND_SERVICE)", err)
-	}
-
-	tlsListener := tls.NewListener(listener, server.TLSConfig)
-
-	return &httpsProxyServer{
-		server:   server,
-		listener: tlsListener,
-		target:   target,
-		certFile: certFile.Name(),
-	}, nil
-}
-
-func (p *httpsProxyServer) Start() {
-	p.wg.Go(func() {
-		_ = p.server.Serve(p.listener)
-	})
-}
-
-func (p *httpsProxyServer) Stop() {
-	_ = p.listener.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = p.server.Shutdown(ctx)
-	p.wg.Wait()
-}
-
-var httpsProxy *httpsProxyServer //nolint:gochecknoglobals // Test fixture shared by TestMain.
-
-// setupHostsEntries adds entries to /etc/hosts to redirect Google API domains to localhost.
-func setupHostsEntries() error {
-	entries := []string{
-		"127.0.0.1 www.googleapis.com",
-		"127.0.0.1 storage.googleapis.com",
-		"127.0.0.1 oauth2.googleapis.com",
-	}
-
-	for _, entry := range entries {
-		// Check if entry already exists.
-		//nolint:gosec // G204: test-only, fixed entries
-		cmd := exec.CommandContext(context.Background(), "grep", "-q", strings.Fields(entry)[1], "/etc/hosts")
-		if cmd.Run() == nil {
-			// Entry already exists, skip
-			continue
-		}
-
-		// Add entry (requires privileges).
-		//nolint:gosec // G204: test-only, controlled entry
-		cmd = exec.CommandContext(context.Background(), "sh", "-c", fmt.Sprintf("echo '%s' >> /etc/hosts", entry))
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to add %s to /etc/hosts: %w", entry, err)
-		}
-	}
-
-	return nil
-}
-
-// teardownHostsEntries removes entries from /etc/hosts that were added for the emulator.
-func teardownHostsEntries() {
-	domains := []string{
-		"www.googleapis.com",
-		"storage.googleapis.com",
-		"oauth2.googleapis.com",
-	}
-
-	for _, domain := range domains {
-		// Remove entry (requires privileges).
-		//nolint:gosec // G204: test-only, fixed domains
-		pattern := fmt.Sprintf("/%s/d", strings.ReplaceAll(domain, ".", "\\."))
-		cmd := exec.CommandContext(context.Background(), "sed", "-i", pattern, "/etc/hosts")
-		_ = cmd.Run() // Ignore errors - entry might not exist
-	}
-}
-
 // TestMain sets up and tears down the HTTPS proxy and /etc/hosts entries for all tests in this package.
-// TestMain runs once before all tests and once after all tests complete.
-// It applies to all test files in the same package (gcs_test package).
 func TestMain(m *testing.M) {
-	// Setup /etc/hosts entries if GCSMOCK_ENDPOINT is set
-	if os.Getenv("GCSMOCK_ENDPOINT") != "" {
-		if err := setupHostsEntries(); err != nil {
-			fmt.Printf("Warning: Could not modify /etc/hosts: %v\n", err)
-			fmt.Printf("Tests may fail if /etc/hosts entries are not present\n")
-		} else {
-			fmt.Println("Added /etc/hosts entries for Google API domains")
-		}
-	}
-
-	// Start HTTPS proxy before all tests if GCSMOCK_ENDPOINT is set
-	if os.Getenv("GCSMOCK_ENDPOINT") != "" {
-		endpoint := os.Getenv("GCSMOCK_ENDPOINT")
-		endpoint = strings.TrimSuffix(endpoint, "/")
-		target := endpoint
-
-		var err error
-		httpsProxy, err = newHTTPSProxyServer(target)
-		if err != nil {
-			// Fail fast: with /etc/hosts redirecting Google domains to 127.0.0.1,
-			// OAuth/token calls will hit localhost:443 and fail with unclear errors
-			// if the proxy is not listening. Require the proxy to start.
-			fmt.Fprintf(os.Stderr, "Fatal: cannot start HTTPS proxy on port 443: %v\n", err)
-			fmt.Fprintf(os.Stderr, "This may require root or CAP_NET_BIND_SERVICE. Exiting.\n")
-			os.Exit(1)
-		}
-		httpsProxy.Start()
-		// Set SSL_CERT_FILE to trust our self-signed certificate
-		// This is respected by Go's crypto/x509 package when loading the system cert pool
-		// and will affect all TLS connections, including those made by OAuth2 clients
-		os.Setenv("SSL_CERT_FILE", httpsProxy.certFile)
-		fmt.Printf("HTTPS proxy started on port 443, certificate: %s\n", httpsProxy.certFile)
-	}
-
-	// Run all tests
-	code := m.Run()
-
-	// Stop proxy after all tests finish
-	if httpsProxy != nil {
-		httpsProxy.Stop()
-		fmt.Println("HTTPS proxy stopped")
-		httpsProxy = nil
-	}
-
-	// Cleanup /etc/hosts entries
-	if os.Getenv("GCSMOCK_ENDPOINT") != "" {
-		teardownHostsEntries()
-		fmt.Println("Removed /etc/hosts entries for Google API domains")
-	}
-
-	os.Exit(code)
-}
-
-func ensureDummyGCSCreds(t *testing.T) {
-	t.Helper()
-
-	if os.Getenv("GCSMOCK_ENDPOINT") != "" {
-		credsFile := path.Join(t.TempDir(), "dummy_creds.json")
-
-		priv, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		privPEM := pem.EncodeToMemory(&pem.Block{
-			Type:  "PRIVATE KEY",
-			Bytes: privBytes,
-		})
-
-		content := fmt.Sprintf(`{"type": "service_account", "project_id": "test-project", `+
-			`"client_email": "test@test.com", "private_key": %q}`, string(privPEM))
-		err = os.WriteFile(credsFile, []byte(content), 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsFile)
-	}
+	gcsemulator.Main(m)
 }
 
 func cleanupStorage(store driver.StorageDriver, name string) {
@@ -442,9 +146,87 @@ func createObjectsStore(rootDir string, cacheDir string, dedupe bool) (
 	return store, il, nil
 }
 
+// createObjectsStoreWithRedis is like createObjectsStore but uses a redis cache driver,
+// matching remoteCache:true + cacheDriver redis deployments (see issue 4463).
+func createObjectsStoreWithRedis(rootDir string, dedupe bool, redisAddr string) (
+	driver.StorageDriver,
+	storageTypes.ImageStore,
+	error,
+) {
+	bucket := "zot-storage-test"
+
+	endpoint := os.Getenv("GCSMOCK_ENDPOINT")
+	if endpoint == "" {
+		return nil, nil, errGCSMockEndpointNotSet
+	}
+
+	url := strings.TrimSuffix(endpoint, "/") + "/storage/v1/b?project=test-project"
+	body := fmt.Sprintf(`{"name": "%s"}`, bucket)
+	//nolint:gosec // URL points to gcsmock endpoint in tests
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		url,
+		strings.NewReader(body),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // G107: Test mock
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	okStatus := resp.StatusCode == http.StatusOK ||
+		resp.StatusCode == http.StatusCreated ||
+		resp.StatusCode == http.StatusConflict
+	if !okStatus {
+		respBody, _ := io.ReadAll(resp.Body)
+
+		return nil, nil, fmt.Errorf("%w %s: status %d body %s",
+			errBucketCreateFailed, bucket, resp.StatusCode, string(respBody))
+	}
+
+	storageDriverParams := map[string]any{
+		"rootDir": rootDir,
+		"name":    "gcs",
+		"bucket":  bucket,
+	}
+
+	storeName := fmt.Sprintf("%v", storageDriverParams["name"])
+
+	store, err := factory.Create(context.Background(), storeName, storageDriverParams)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	log := log.NewTestLogger()
+	metrics := monitoring.NewNopMetricServer()
+
+	client, err := rediscfg.GetRedisClient(map[string]any{"url": redisAddr}, log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cacheDriver, err := storage.Create("redis", cache.RedisDriverParameters{
+		Client:      client,
+		RootDir:     rootDir,
+		UseRelPaths: false,
+	}, log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	il := gcs.NewImageStore(rootDir, "", dedupe, false, log, metrics, nil, store, cacheDriver, nil, nil)
+
+	return store, il, nil
+}
+
 func TestGCSDriver(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	uuid, err := guuid.NewV4()
 	if err != nil {
@@ -568,7 +350,7 @@ func TestGCSDriver(t *testing.T) {
 
 func TestGCSDedupe(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	Convey("Dedupe", t, func(c C) {
 		uuid, err := guuid.NewV4()
@@ -739,9 +521,74 @@ func TestGCSDedupe(t *testing.T) {
 	})
 }
 
+// TestGCSRedisDedupePreservesLateOrigin matches the issue-4463 config shape:
+// GCS storageDriver + dedupe + redis remoteCache. Pushing b/img before a/img makes
+// b the cached origin; a startup-style walk must not empty it.
+func TestGCSRedisDedupePreservesLateOrigin(t *testing.T) {
+	tskip.SkipGCS(t)
+	gcsemulator.EnsureDummyCreds(t)
+
+	miniRedis := miniredis.RunT(t)
+	redisAddr := "redis://" + miniRedis.Addr()
+
+	uuid, err := guuid.NewV4()
+	if err != nil {
+		panic(err)
+	}
+
+	testDir := path.Join("/oci-repo-test", uuid.String())
+
+	storeDriver, imgStore, err := createObjectsStoreWithRedis(testDir, true, redisAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupStorage(storeDriver, testDir)
+
+	Convey("GCS+redis rebuild must not empty late-sorting origin", t, func() {
+		ctx := context.Background()
+		content := []byte("gcs-shared-layer-content-for-dedupe-origin-preserve")
+		digest := godigest.FromBytes(content)
+
+		_, _, err := imgStore.FullBlobUpload(ctx, "b/img", bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+
+		_, _, err = imgStore.FullBlobUpload(ctx, "a/img", bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+
+		originPath := imgStore.BlobPath("b/img", digest)
+		stubPath := imgStore.BlobPath("a/img", digest)
+
+		originInfo, err := storeDriver.Stat(context.Background(), originPath)
+		So(err, ShouldBeNil)
+		So(originInfo.Size(), ShouldBeGreaterThan, 0)
+
+		stubInfo, err := storeDriver.Stat(context.Background(), stubPath)
+		So(err, ShouldBeNil)
+		So(stubInfo.Size(), ShouldEqual, 0)
+
+		_, imgStore2, err := createObjectsStoreWithRedis(testDir, true, redisAddr)
+		So(err, ShouldBeNil)
+
+		err = imgStore2.RunDedupeForDigest(ctx, digest, true, []string{stubPath, originPath})
+		So(err, ShouldBeNil)
+
+		originInfo, err = storeDriver.Stat(context.Background(), originPath)
+		So(err, ShouldBeNil)
+		So(originInfo.Size(), ShouldEqual, int64(len(content)))
+
+		got, err := imgStore2.GetBlobContent("b/img", digest)
+		So(err, ShouldBeNil)
+		So(got, ShouldResemble, content)
+
+		got, err = imgStore2.GetBlobContent("a/img", digest)
+		So(err, ShouldBeNil)
+		So(got, ShouldResemble, content)
+	})
+}
+
 func TestGCSPullRange(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	Convey("Pull range", t, func(c C) {
 		uuid, err := guuid.NewV4()
@@ -809,7 +656,7 @@ func TestGCSPullRange(t *testing.T) {
 
 func TestGCSGetAllDedupeReposCandidates(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	uuid, err := guuid.NewV4()
 	if err != nil {
@@ -860,7 +707,7 @@ func TestGCSGetAllDedupeReposCandidates(t *testing.T) {
 
 func TestGCSDeleteBlobsInUse(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	Convey("Setup manifest", t, func() {
 		uuid, err := guuid.NewV4()
@@ -959,7 +806,7 @@ func TestGCSDeleteBlobsInUse(t *testing.T) {
 
 func TestGCSStorageAPIs(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	uuid, err := guuid.NewV4()
 	if err != nil {
@@ -1656,20 +1503,14 @@ func TestGCSStorageAPIs(t *testing.T) {
 				wg.Add(2)
 
 				go func() {
-					var lockLatency time.Time
-
 					defer wg.Done()
-					imgStore.Lock(&lockLatency)
-					func() {}()
-					imgStore.Unlock(&lockLatency)
+
+					_ = imgStore.WithRepoLock("test", func() error { return nil })
 				}()
 				go func() {
-					var lockLatency time.Time
-
 					defer wg.Done()
-					imgStore.RLock(&lockLatency)
-					func() {}()
-					imgStore.RUnlock(&lockLatency)
+
+					_ = imgStore.WithRepoReadLock("test", func() error { return nil })
 				}()
 			}
 
@@ -1680,7 +1521,7 @@ func TestGCSStorageAPIs(t *testing.T) {
 
 func TestGCSReuploadCorruptedBlob(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	uuid, err := guuid.NewV4()
 	if err != nil {
@@ -1733,7 +1574,7 @@ func TestGCSReuploadCorruptedBlob(t *testing.T) {
 		ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 		So(ok, ShouldBeFalse)
 		So(size, ShouldNotEqual, blobSize)
-		So(err, ShouldEqual, zerr.ErrBlobNotFound)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 		err = WriteImageToFileSystem(image, repoName, tag, storeController)
 		So(err, ShouldBeNil)
@@ -1775,7 +1616,7 @@ func TestGCSReuploadCorruptedBlob(t *testing.T) {
 		ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 		So(ok, ShouldBeFalse)
 		So(size, ShouldNotEqual, blobSize)
-		So(err, ShouldEqual, zerr.ErrBlobNotFound)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 		err = WriteMultiArchImageToFileSystem(image, repoName, tag, storeController)
 		So(err, ShouldBeNil)
@@ -1794,7 +1635,7 @@ func TestGCSReuploadCorruptedBlob(t *testing.T) {
 
 func TestGCSStorageHandler(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	Convey("Test storage handler", t, func() {
 		firstRootDir := "/util_test1"
@@ -1844,7 +1685,7 @@ func TestGCSStorageHandler(t *testing.T) {
 
 func TestGCSMandatoryAnnotations(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	uuid, err := guuid.NewV4()
 	if err != nil {
@@ -2030,7 +1871,7 @@ func pushRandomImageIndexGCS(imgStore storageTypes.ImageStore, repoName string,
 
 func TestGCSGarbageCollectImageManifest(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	testLog := log.NewTestLogger()
 	audit := log.NewAuditLogger("debug", "")
@@ -2250,7 +2091,7 @@ func TestGCSGarbageCollectImageManifest(t *testing.T) {
 
 func TestGCSGarbageCollectImageIndex(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	testLog := log.NewTestLogger()
 	audit := log.NewAuditLogger("debug", "")
@@ -2403,7 +2244,7 @@ func TestGCSGarbageCollectImageIndex(t *testing.T) {
 
 func TestGCSGarbageCollectChainedImageIndexes(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	testLog := log.NewTestLogger()
 	audit := log.NewAuditLogger("debug", "")
@@ -2871,7 +2712,7 @@ func TestGCSGarbageCollectChainedImageIndexes(t *testing.T) {
 
 func TestGCSCheckAllBlobsIntegrity(t *testing.T) {
 	tskip.SkipGCS(t)
-	ensureDummyGCSCreds(t)
+	gcsemulator.EnsureDummyCreds(t)
 
 	Convey("test with GCS storage", t, func() {
 		uuid, err := guuid.NewV4()
@@ -2983,6 +2824,7 @@ func RunGCSCheckAllBlobsIntegrityTests( //nolint: thelper
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
+			// Top-level listed manifest Missing is soft-skipped (concurrent delete race).
 			So(actual, ShouldNotContainSubstring, "affected")
 
 			index, err := common.GetIndex(imgStore, repoName, testLog)
@@ -3115,7 +2957,8 @@ func RunGCSCheckAllBlobsIntegrityTests( //nolint: thelper
 			// get content of layer
 			imageRes := storage.CheckLayers(repoName, "1.0", []ispec.Descriptor{{Digest: digest}}, imgStore)
 			So(imageRes.Status, ShouldEqual, "affected")
-			So(imageRes.Error, ShouldEqual, "blob not found")
+			// mapStorageErr wraps Missing under ErrBlobNotFound; match the sentinel text.
+			So(imageRes.Error, ShouldContainSubstring, "blob not found")
 
 			buff := bytes.NewBufferString("")
 
@@ -3352,6 +3195,7 @@ func RunGCSCheckAllBlobsIntegrityTests( //nolint: thelper
 			actual = strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
 			So(actual, ShouldContainSubstring, "test 1.0 ok")
+			// Top-level listed index blob Missing is soft-skipped (concurrent delete race).
 			So(actual, ShouldNotContainSubstring, "test affected")
 
 			index.Manifests[0].MediaType = "invalid"
@@ -3413,7 +3257,8 @@ func RunGCSCheckAllBlobsIntegrityTests( //nolint: thelper
 			str := space.ReplaceAllString(buff.String(), " ")
 			actual := strings.TrimSpace(str)
 			So(actual, ShouldContainSubstring, "REPOSITORY TAG STATUS AFFECTED BLOB ERROR")
-			So(actual, ShouldNotContainSubstring, fmt.Sprintf("test 1.0 affected %s blob not found", manifestDig))
+			// Top-level listed manifest Missing is soft-skipped (concurrent delete race).
+			So(actual, ShouldNotContainSubstring, "test 1.0 affected "+manifestDig+" blob not found")
 
 			index, err := common.GetIndex(imgStore, repoName, testLog)
 			So(err, ShouldBeNil)

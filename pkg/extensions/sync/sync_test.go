@@ -69,12 +69,14 @@ const (
 
 var (
 	// no retries unless explicitly configured in each test.
-	maxRetries   = 1      //nolint: gochecknoglobals
-	username     = "test" //nolint: gochecknoglobals
-	password     = "test" //nolint: gochecknoglobals
-	errSync      = errors.New("sync error, src oci repo differs from dest one")
-	errBadStatus = errors.New("bad http status")
-	ErrTestError = errors.New("testError")
+	maxRetries                = 1      //nolint: gochecknoglobals
+	username                  = "test" //nolint: gochecknoglobals
+	password                  = "test" //nolint: gochecknoglobals
+	errSync                   = errors.New("sync error, src oci repo differs from dest one")
+	errBadStatus              = errors.New("bad http status")
+	errManifestNoResponse     = errors.New("manifest request returned no response")
+	errManifestStatusMismatch = errors.New("manifest status mismatch")
+	ErrTestError              = errors.New("testError")
 )
 
 type TagsList struct {
@@ -452,7 +454,7 @@ func TestOnDemand(t *testing.T) {
 
 			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 			err = os.Chmod(path.Join(destDir, testImage, syncConstants.SyncBlobUploadDir), 0o755)
 			if err != nil {
@@ -471,7 +473,8 @@ func TestOnDemand(t *testing.T) {
 
 			resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			// Unwritable destination blobs dir is a hard sync failure, not a soft miss.
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 			err = os.Chmod(path.Join(destDir, testImage, "blobs"), 0o755)
 			if err != nil {
@@ -1564,7 +1567,8 @@ func TestDockerImagesAreSkipped(t *testing.T) {
 
 			resp, err = resty.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			// Unreadable upstream config is a hard sync failure, not a soft miss.
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 		})
 
 		Convey("skipping already synced multiarch docker image", func() {
@@ -2140,7 +2144,8 @@ func TestPermsDenied(t *testing.T) {
 
 		resp, err := resty.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		// Unwritable .sync cache dir is a hard sync failure, not a soft miss.
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 		err = os.Chmod(syncSubDir, 0o755)
 		if err != nil {
@@ -2574,15 +2579,17 @@ func TestBadTLS(t *testing.T) {
 
 		resp, _ := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + "invalid")
 		So(resp, ShouldNotBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		// Matching prefix: on-demand sync runs and TLS verify fails → opaque 503.
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 		resp, _ = destClient.R().Get(destBaseURL + "/v2/" + "invalid" + "/manifests/" + testImageTag)
 		So(resp, ShouldNotBeNil)
+		// Unmatched prefix: soft filter miss stays 404.
 		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
 
 		resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -3013,10 +3020,10 @@ func TestBearerAuth(t *testing.T) {
 
 		So(destTagsList, ShouldResemble, srcTagsList)
 
-		// unauthorized namespace
+		// unauthorized namespace: on-demand sync hits upstream 401 → opaque 503.
 		resp, err = destClient.R().Get(destBaseURL + "/v2/" + testCveImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -3187,7 +3194,8 @@ func TestBasicAuth(t *testing.T) {
 
 			resp, err := resty.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			// Wrong upstream credentials: on-demand sync hard-fails → opaque 503.
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 		})
 
 		Convey("Verify sync basic auth with bad file credentials", func() {
@@ -3287,13 +3295,13 @@ func TestBasicAuth(t *testing.T) {
 			}
 
 			unreacheableSyncRegistryConfig1 := syncconf.RegistryConfig{
-				URLs:       []string{"localhost:9999"},
+				URLs:       []string{"http://localhost:9999"},
 				OnDemand:   true,
 				MaxRetries: &maxRetries,
 			}
 
 			unreacheableSyncRegistryConfig2 := syncconf.RegistryConfig{
-				URLs:       []string{"localhost:9999"},
+				URLs:       []string{"http://localhost:9999"},
 				OnDemand:   false,
 				MaxRetries: &maxRetries,
 			}
@@ -3330,6 +3338,8 @@ func TestBasicAuth(t *testing.T) {
 				panic(err)
 			}
 
+			// Unreachable on-demand registries are tried first, but a soft miss from
+			// a registry that answered (repo/tag not found) outranks dial failures.
 			resp, err = destClient.R().Get(destBaseURL + "/v2/" + "inexistent" + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
 			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
@@ -3393,7 +3403,10 @@ func TestBadURL(t *testing.T) {
 					},
 				},
 			},
-			URLs:         []string{"bad-registry-url]", "%"},
+			// Use a URL that still initializes the sync client. A bare "%" fails
+			// url.Parse in parseRegistryURLs, so EnableSyncExtension never registers
+			// on-demand and the request would stay a local 404.
+			URLs:         []string{"http://bad-registry-url]"},
 			PollInterval: updateDuration,
 			TLSVerify:    &tlsVerify,
 			CertDir:      "",
@@ -3414,9 +3427,11 @@ func TestBadURL(t *testing.T) {
 
 		defer dcm.StopServer()
 
+		// Misconfigured registry host never produces a content answer. With no soft
+		// miss from an upstream that responded, on-demand surfaces an opaque 503.
 		resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -3686,9 +3701,10 @@ func TestInvalidCerts(t *testing.T) {
 
 		defer dcm.StopServer()
 
+		// Matching prefix: on-demand sync runs and bad CA material fails TLS → opaque 503.
 		resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -4014,9 +4030,10 @@ func TestOnDemandRepoErr(t *testing.T) {
 
 		defer dcm.StopServer()
 
+		// Matching prefix with an unusable upstream URL: sync hard-fails → opaque 503.
 		resp, err := resty.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -4464,10 +4481,10 @@ func TestPeriodicallySignaturesErr(t *testing.T) {
 
 			So(found, ShouldBeTrue)
 
-			// should not be synced nor sync on demand
+			// Upstream permission denied is a hard sync failure → opaque 503 on demand.
 			resp, err := resty.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/" + testImageTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 		})
 
 		Convey("Trigger error on cosign signature", func() {
@@ -4512,10 +4529,10 @@ func TestPeriodicallySignaturesErr(t *testing.T) {
 
 			So(found, ShouldBeTrue)
 
-			// should not be synced nor sync on demand
+			// Upstream blob permission denied is a hard sync failure → opaque 503 on demand.
 			resp, err := resty.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/" + cosignTag)
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+			So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 			data, err := os.ReadFile(dctlr.Config.Log.Output)
 			So(err, ShouldBeNil)
@@ -5762,9 +5779,10 @@ func TestOnDemandRetryGoroutine(t *testing.T) {
 
 		defer dcm.StopServer()
 
+		// Upstream is not listening yet: dial failure is hard → opaque 503, then background retry.
 		resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 		scm.StartServer()
 
@@ -5897,9 +5915,10 @@ func TestOnDemandRetryGoroutineErr(t *testing.T) {
 
 		defer dcm.StopServer()
 
+		// Unreachable upstream: dial failures are hard → opaque 503 (not a soft miss).
 		resp, err := destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 
 		found, err := test.ReadLogFileAndSearchString(dctlr.Config.Log.Output,
 			"failed to sync image", 15*time.Second)
@@ -5918,7 +5937,7 @@ func TestOnDemandRetryGoroutineErr(t *testing.T) {
 
 		resp, err = destClient.R().Get(destBaseURL + "/v2/" + testImage + "/manifests/" + testImageTag)
 		So(err, ShouldBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
 	})
 }
 
@@ -7562,8 +7581,8 @@ func TestSyncImageIndex(t *testing.T) {
 				t.Logf("waitsync(%s, %s)", dctlr.Config.Storage.RootDirectory, "index")
 				waitSync(dctlr.Config.Storage.RootDirectory, "index")
 
-				resp, err = resty.R().SetHeader("Content-Type", ispec.MediaTypeImageIndex).
-					Get(destBaseURL + "/v2/index/manifests/latest")
+				resp, err = waitForManifestStatus(destBaseURL, "index", "latest", ispec.MediaTypeImageIndex,
+					http.StatusOK, 30*time.Second)
 				So(err, ShouldBeNil)
 				So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 				So(resp.Body(), ShouldNotBeEmpty)
@@ -7688,8 +7707,8 @@ func TestSyncImageIndex(t *testing.T) {
 				// Wait for SyncRepo to finish processing all tags for the "index" repo.
 				So(waitFinishedSyncingRepo(dctlr.Config.Log.Output, "index", 60*time.Second), ShouldBeTrue)
 
-				resp, err = resty.R().SetHeader("Content-Type", ispec.MediaTypeImageIndex).
-					Get(destBaseURL + "/v2/index/manifests/root")
+				resp, err = waitForManifestStatus(destBaseURL, "index", "root", ispec.MediaTypeImageIndex,
+					http.StatusOK, 30*time.Second)
 				So(err, ShouldBeNil)
 				So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 				So(resp.Body(), ShouldNotBeEmpty)
@@ -8660,6 +8679,115 @@ func TestOnDemandBlobSeeding(t *testing.T) {
 			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 		})
 
+		Convey("a streamed pull of a new tag seeds its shared layers too", func() {
+			// Streaming returns the manifest at once and syncs in the background; that sync must
+			// still seed layers the repo already stores rather than download them again (#4386).
+			syncRegistryConfig := syncconf.RegistryConfig{
+				URLs:      []string{srcBaseURL},
+				OnDemand:  true,
+				TLSVerify: &tlsVerify,
+				Stream:    &defaultVal,
+			}
+
+			syncConfig := &syncconf.Config{
+				Enable:     &defaultVal,
+				Registries: []syncconf.RegistryConfig{syncRegistryConfig},
+			}
+
+			dctlr, destDir, destClient := makeDownstreamServer(t, false, syncConfig)
+			defer os.RemoveAll(destDir)
+
+			dcm := test.NewControllerManager(dctlr)
+			destBaseURL := dcm.StartAndWait()
+
+			defer dcm.StopServer()
+
+			repoName := "seed-stream"
+
+			// The background sync commits after the response, so poll the downstream store.
+			waitForLocalBlob := func(digest godigest.Digest) bool {
+				blobPath := path.Join(destDir, repoName, "blobs", digest.Algorithm().String(), digest.Encoded())
+
+				for range 300 {
+					if _, err := os.Stat(blobPath); err == nil {
+						return true
+					}
+
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				return false
+			}
+
+			// The background sync's last step counts the streamed GET in metaDB (onSynced). Wait
+			// for it before the deferred StopServer closes metaDB under it.
+			waitForDownloadCounted := func(digest godigest.Digest) bool {
+				for range 300 {
+					repoMeta, err := dctlr.MetaDB.GetRepoMeta(context.Background(), repoName)
+					if err == nil && repoMeta.Statistics[digest.String()].DownloadCount > 0 {
+						return true
+					}
+
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				return false
+			}
+
+			sharedLayers := make([][]byte, 3)
+			for i := range sharedLayers {
+				sharedLayers[i] = fmt.Appendf(nil, "shared layer %d for streamed seeding test", i)
+			}
+
+			image1 := CreateImageWith().LayerBlobs(sharedLayers).RandomConfig().Build()
+
+			err := UploadImage(image1, srcBaseURL, repoName, "1.0")
+			So(err, ShouldBeNil)
+
+			resp, err := destClient.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/1.0")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			So(waitForLocalBlob(image1.ManifestDescriptor.Digest), ShouldBeTrue)
+
+			for _, layer := range image1.Manifest.Layers {
+				So(waitForLocalBlob(layer.Digest), ShouldBeTrue)
+			}
+
+			So(waitForDownloadCounted(image1.ManifestDescriptor.Digest), ShouldBeTrue)
+
+			image2 := CreateImageWith().LayerBlobs(sharedLayers).RandomConfig().Build()
+			So(image2.DigestStr(), ShouldNotEqual, image1.DigestStr())
+
+			err = UploadImage(image2, srcBaseURL, repoName, "2.0")
+			So(err, ShouldBeNil)
+
+			// Upstream can no longer serve the shared layers, so tag 2.0 only commits if the
+			// streamed sync seeds them from the local store.
+			for _, layer := range image2.Manifest.Layers {
+				err := os.Remove(path.Join(srcDir, repoName, "blobs",
+					layer.Digest.Algorithm().String(), layer.Digest.Encoded()))
+				So(err, ShouldBeNil)
+			}
+
+			resp, err = destClient.R().Get(destBaseURL + "/v2/" + repoName + "/manifests/2.0")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			So(godigest.FromBytes(resp.Body()), ShouldEqual, image2.ManifestDescriptor.Digest)
+
+			So(waitForLocalBlob(image2.ConfigDescriptor.Digest), ShouldBeTrue)
+			So(waitForLocalBlob(image2.ManifestDescriptor.Digest), ShouldBeTrue)
+
+			// Every layer is servable: the seeded ones come from storage, not their unused streams.
+			for _, layer := range image2.Manifest.Layers {
+				resp, err := destClient.R().Get(destBaseURL + "/v2/" + repoName + "/blobs/" + layer.Digest.String())
+				So(err, ShouldBeNil)
+				So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+			}
+
+			So(waitForDownloadCounted(image2.ManifestDescriptor.Digest), ShouldBeTrue)
+		})
+
 		Convey("a new tag of an already stored image is not fetched at all", func() {
 			syncRegistryConfig := syncconf.RegistryConfig{
 				URLs:       []string{srcBaseURL},
@@ -8853,6 +8981,43 @@ func waitSync(rootDir, repoName string) {
 
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func waitForManifestStatus(baseURL, repo, reference, contentType string,
+	expectedStatus int, timeout time.Duration,
+) (*resty.Response, error) {
+	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", baseURL, repo, reference)
+	deadline := time.Now().Add(timeout)
+
+	// Resty's default client has no request timeout: bound every request by the same
+	// deadline, so a stalled handler cannot hold the poll past it.
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	var (
+		resp *resty.Response
+		err  error
+	)
+
+	for time.Now().Before(deadline) {
+		resp, err = resty.R().SetContext(ctx).SetHeader("Content-Type", contentType).Get(manifestURL)
+		if err == nil && resp.StatusCode() == expectedStatus {
+			return resp, nil
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if resp == nil {
+		return nil, errManifestNoResponse
+	}
+
+	return resp, fmt.Errorf("%w: manifest %s expected status %d, got %d", errManifestStatusMismatch,
+		manifestURL, expectedStatus, resp.StatusCode())
 }
 
 func pushBlob(url string, repoName string, buf []byte) godigest.Digest {

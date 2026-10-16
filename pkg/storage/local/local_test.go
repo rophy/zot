@@ -1610,6 +1610,11 @@ func TestDedupeLinks(t *testing.T) {
 }
 
 func TestDedupeRestoreCompleteMarker(t *testing.T) {
+	// OnRunComplete runs in a goroutine (slow remote marker PUTs must not block
+	// the scheduler worker). Wait for the post-write log line, not only the file:
+	// WriteFile can finish before the following Info is visible in the buffer.
+	const logWait = 5 * time.Second
+
 	waitForMarker := func(t *testing.T, markerPath, expected string) {
 		t.Helper()
 
@@ -1627,15 +1632,12 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 	Convey("Restore-complete marker lifecycle", t, func(c C) {
 		dir := t.TempDir()
-
-		logBuf := test.NewThreadSafeLogBuffer()
-
-		log := zlog.NewLoggerWithWriter("debug", logBuf)
 		metrics := monitoring.NewNopMetricServer()
-
 		markerPath := path.Join(dir, storageConstants.DedupeRestoreCompleteMarker)
 
 		Convey("dedupe=false on an empty store writes the restore-complete marker", func() {
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1643,11 +1645,11 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			waitForMarker(t, markerPath, storageConstants.DedupeRestoreMarkerComplete)
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker written", 1, logWait), ShouldBeTrue)
 
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "restore-complete marker written")
+			data, err := os.ReadFile(markerPath)
+			So(err, ShouldBeNil)
+			So(strings.TrimSpace(string(data)), ShouldEqual, storageConstants.DedupeRestoreMarkerComplete)
 		})
 
 		Convey("dedupe=false with a complete marker skips the restore scan", func() {
@@ -1655,6 +1657,8 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1662,9 +1666,7 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "skipping dedupe restore scan")
+			So(test.WaitForLogMessages(logBuf, "skipping dedupe restore scan", 1, logWait), ShouldBeTrue)
 
 			data, err := os.ReadFile(markerPath)
 			So(err, ShouldBeNil)
@@ -1676,6 +1678,8 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
+			logBuf := test.NewThreadSafeLogBuffer()
+			log := zlog.NewLoggerWithWriter("debug", logBuf)
 			imgStore := local.NewImageStore(dir, false, true, log, metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
@@ -1683,11 +1687,11 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker present but not complete", 1, logWait),
+				ShouldBeTrue)
+			// Completion rewrite is async; wait for the post-write log, then confirm content.
+			So(test.WaitForLogMessages(logBuf, "restore-complete marker written", 1, logWait), ShouldBeTrue)
 			waitForMarker(t, markerPath, storageConstants.DedupeRestoreMarkerComplete)
-
-			taskScheduler.Shutdown()
-
-			So(logBuf.String(), ShouldContainSubstring, "restore-complete marker present but not complete")
 		})
 
 		Convey("dedupe=true removes an existing restore-complete marker", func() {
@@ -1695,15 +1699,14 @@ func TestDedupeRestoreCompleteMarker(t *testing.T) {
 				storageConstants.DefaultFilePerms)
 			So(err, ShouldBeNil)
 
-			imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, nil, nil, nil)
+			imgStore := local.NewImageStore(dir, true, true, zlog.NewTestLogger(), metrics, nil, nil, nil, nil)
 
 			taskScheduler := runAndGetScheduler()
 			defer taskScheduler.Shutdown()
 
 			imgStore.RunDedupeBlobs(time.Duration(0), taskScheduler)
 
-			taskScheduler.Shutdown()
-
+			// Delete of the marker is synchronous in RunDedupeBlobs before the generator runs.
 			_, err = os.Stat(markerPath)
 			So(errors.Is(err, fs.ErrNotExist), ShouldBeTrue)
 		})
@@ -1734,7 +1737,9 @@ func TestCheckBlobTreatsRealEmptyBlobAsPresent(t *testing.T) {
 
 // recheckDriver wraps local.Driver and, for a single target path, returns a
 // custom result on the second Stat call to simulate the state observed by
-// restoreDedupedBlobs' re-check under the write lock.
+// restoreDedupedBlobs' re-check under the write lock. It reports a name that is
+// not the local one, so the store uses the remote lifecycle, where zero-size
+// copies are placeholders the restore walk refills.
 type recheckDriver struct {
 	*local.Driver
 
@@ -1746,6 +1751,8 @@ type recheckDriver struct {
 	recheckSize int64
 	recheckErr  error
 }
+
+func (d *recheckDriver) Name() string { return "remote-test" }
 
 func (d *recheckDriver) Stat(path string) (storagedriver.FileInfo, error) {
 	if path == d.targetPath {
@@ -2052,7 +2059,7 @@ func TestNegativeCases(t *testing.T) {
 
 		_, err = imgStore.ValidateRepo("invalid-test")
 		So(err, ShouldNotBeNil)
-		So(err, ShouldEqual, zerr.ErrRepoNotFound)
+		So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
 
 		err = os.Chmod(path.Join(dir, "invalid-test"), 0o755) // remove all perms
 		if err != nil {
@@ -2977,8 +2984,8 @@ func TestGarbageCollectErrors(t *testing.T) {
 		Convey("Corrupt untagged manifest blob aborts GC", func() {
 			digest = putUntaggedManifestForGCErrors(imgStore, repoName, bdgst1, bsize1)
 
-			// Non-empty corrupt content: size 0 is treated as a dedupe placeholder (blob not found)
-			// and soft-continues; invalid JSON must fail closed in identify.
+			// Non-empty corrupt content: a zero-size copy fails closed as blob not found and
+			// soft-continues; invalid JSON must fail closed in identify.
 			err = os.WriteFile(imgStore.BlobPath(repoName, digest), []byte("not-a-manifest"), 0o600)
 			So(err, ShouldBeNil)
 
@@ -3632,28 +3639,29 @@ func TestBlobChunkUploadDoesNotBlockOnStoreLock(t *testing.T) {
 		repo := "chunk-under-lock"
 
 		assertCopyWhileLocked := func(put func() (int64, error)) {
-			var lockLatency time.Time
-			imgStore.Lock(&lockLatency)
-
-			done := make(chan error, 1)
-
-			go func() {
-				_, err := put()
-				done <- err
-			}()
-
 			blocked := true
 
-			select {
-			case err := <-done:
-				imgStore.Unlock(&lockLatency)
-				blocked = false
-				So(err, ShouldBeNil)
-			case <-time.After(5 * time.Second):
-				imgStore.Unlock(&lockLatency)
-			}
+			var putErr error
+
+			_ = imgStore.WithRepoLock(repo, func() error {
+				done := make(chan error, 1)
+
+				go func() {
+					_, err := put()
+					done <- err
+				}()
+
+				select {
+				case putErr = <-done:
+					blocked = false
+				case <-time.After(5 * time.Second):
+				}
+
+				return nil
+			})
 
 			So(blocked, ShouldBeFalse)
+			So(putErr, ShouldBeNil)
 		}
 
 		Convey("PutBlobChunkStreamed", func() {
@@ -3730,36 +3738,37 @@ func TestFullBlobUploadDoesNotBlockOnStoreLock(t *testing.T) {
 
 		pipeReader, pipeWriter := io.Pipe()
 
-		var lockLatency time.Time
-		imgStore.Lock(&lockLatency)
-
 		errCh := make(chan error, 1)
-
-		go func() {
-			_, _, err := imgStore.FullBlobUpload(ctx, repo, pipeReader, digest)
-			errCh <- err
-		}()
-
-		wrote := make(chan error, 1)
-
-		go func() {
-			_, err := pipeWriter.Write(content)
-			_ = pipeWriter.Close()
-			wrote <- err
-		}()
-
 		blocked := true
 
-		select {
-		case err := <-wrote:
-			blocked = false
-			So(err, ShouldBeNil)
-		case <-time.After(5 * time.Second):
-			_ = pipeWriter.Close()
-		}
+		var writeErr error
 
-		imgStore.Unlock(&lockLatency)
+		_ = imgStore.WithRepoLock(repo, func() error {
+			go func() {
+				_, _, err := imgStore.FullBlobUpload(ctx, repo, pipeReader, digest)
+				errCh <- err
+			}()
+
+			wrote := make(chan error, 1)
+
+			go func() {
+				_, err := pipeWriter.Write(content)
+				_ = pipeWriter.Close()
+				wrote <- err
+			}()
+
+			select {
+			case writeErr = <-wrote:
+				blocked = false
+			case <-time.After(5 * time.Second):
+				_ = pipeWriter.Close()
+			}
+
+			return nil
+		})
+
 		So(blocked, ShouldBeFalse)
+		So(writeErr, ShouldBeNil)
 		So(<-errCh, ShouldBeNil)
 	})
 }
@@ -4322,6 +4331,23 @@ func TestRunDedupeForDigestSkipsDeletedPaths(t *testing.T) {
 			So(err, ShouldBeNil)
 		})
 
+		Convey("dedupe direction repairs a corrupt zero-size copy", func() {
+			dir := t.TempDir()
+			imgStore := newStore(dir)
+
+			corrupt := writeBlob(dir, "repo-corrupt", []byte{})
+			original := writeBlob(dir, "repo-original", content)
+
+			// a hardlink always holds the content, so a zero-size copy is not a placeholder:
+			// it is neither the origin nor skipped, and the origin gets linked over it
+			err := imgStore.RunDedupeForDigest(context.Background(), digest, true, []string{corrupt, original})
+			So(err, ShouldBeNil)
+
+			repaired, err := os.ReadFile(corrupt)
+			So(err, ShouldBeNil)
+			So(repaired, ShouldResemble, content)
+		})
+
 		Convey("restore direction, every path deleted", func() {
 			dir := t.TempDir()
 			imgStore := newStore(dir)
@@ -4336,41 +4362,6 @@ func TestRunDedupeForDigestSkipsDeletedPaths(t *testing.T) {
 			err := imgStore.RunDedupeForDigest(context.Background(), digest, false,
 				[]string{first, second})
 			So(err, ShouldBeNil)
-		})
-
-		Convey("restore direction, placeholder survives with no content source", func() {
-			dir := t.TempDir()
-			imgStore := newStore(dir)
-
-			original := writeBlob(dir, "repo-original", content)
-			placeholder := writeBlob(dir, "repo-placeholder", []byte{})
-			So(os.Remove(original), ShouldBeNil)
-
-			// the placeholder is still there and nothing holds the content, so this must
-			// fail rather than leave it zero-size
-			err := imgStore.RunDedupeForDigest(context.Background(), digest, false,
-				[]string{original, placeholder})
-			So(err, ShouldNotBeNil)
-		})
-
-		Convey("restore direction", func() {
-			dir := t.TempDir()
-			imgStore := newStore(dir)
-
-			original := writeBlob(dir, "repo-original", content)
-			placeholder := writeBlob(dir, "repo-placeholder", []byte{})
-			deleted := writeBlob(dir, "repo-gone", content)
-			So(os.Remove(deleted), ShouldBeNil)
-
-			err := imgStore.RunDedupeForDigest(context.Background(), digest, false,
-				[]string{deleted, original, placeholder})
-			So(err, ShouldBeNil)
-
-			// the surviving copy was still found as the content source, so the
-			// zero-size placeholder got restored
-			restored, err := os.ReadFile(placeholder)
-			So(err, ShouldBeNil)
-			So(restored, ShouldResemble, content)
 		})
 	})
 }

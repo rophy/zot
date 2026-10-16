@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	guuid "github.com/gofrs/uuid"
@@ -30,6 +31,7 @@ import (
 	"github.com/opencontainers/distribution-spec/specs-go/v1/extensions"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/regclient/regclient/types/manifest"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 
@@ -317,6 +319,8 @@ func (rh *RouteHandler) CheckVersionSupport(response http.ResponseWriter, reques
 // @Success 200 {object}     common.ImageTags
 // @Failure 404 {string}     string                 "not found"
 // @Failure 400 {string}     string                 "bad request"
+// @Failure 503 {string}     string                 "storage temporarily unavailable"
+// @Failure 500 {string}     string                 "internal server error"
 func (rh *RouteHandler) ListTags(response http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodOptions {
 		return
@@ -381,8 +385,20 @@ func (rh *RouteHandler) ListTags(response http.ResponseWriter, request *http.Req
 
 	tags, err := imgStore.GetImageTags(name)
 	if err != nil {
-		e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(map[string]string{"name": name})
-		zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
+		if writeStorageClassError(response, err) {
+			// Transient → 503 / Permanent → 500 — not NAME_UNKNOWN.
+			rh.c.Log.Error().Err(err).Str("repository", name).Msg("failed to list tags")
+
+			return
+		}
+
+		if errors.Is(err, zerr.ErrRepoNotFound) {
+			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(map[string]string{"name": name})
+			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
+		} else {
+			rh.c.Log.Error().Err(err).Str("repository", name).Msg("failed to list tags")
+			response.WriteHeader(http.StatusInternalServerError)
+		}
 
 		return
 	}
@@ -438,6 +454,7 @@ func (rh *RouteHandler) ListTags(response http.ResponseWriter, request *http.Req
 // @Success 200 {string} string "ok"
 // @Header  200 {string} Docker-Content-Digest "Manifest digest of the content"
 // @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable or synchronization failed"
 // @Failure 500 {string} string "internal server error"
 func (rh *RouteHandler) CheckManifest(response http.ResponseWriter, request *http.Request) {
 	if request.Method == http.MethodOptions {
@@ -463,10 +480,17 @@ func (rh *RouteHandler) CheckManifest(response http.ResponseWriter, request *htt
 		return
 	}
 
-	content, digest, mediaType, err := getImageManifest(request.Context(), rh, imgStore, name, reference)
+	// HEAD is not a download: pass no onStreamSynced, so it's never counted.
+	content, digest, mediaType, _, err := getImageManifest(request.Context(), rh, imgStore, name, reference, nil)
 	if err != nil {
 		details := zerr.GetDetails(err)
 		details["reference"] = reference
+
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to check manifest due to storage failure")
+
+			return
+		}
 
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -474,14 +498,13 @@ func (rh *RouteHandler) CheckManifest(response http.ResponseWriter, request *htt
 		} else if errors.Is(err, zerr.ErrManifestNotFound) {
 			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
 			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrSyncParseRemoteRepo) {
-			e := apiErr.NewError(apiErr.DENIED).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusForbidden, apiErr.NewErrorList(e))
+		} else if errors.Is(err, zerr.ErrSyncInternal) {
+			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN)
+			e.Message = zerr.ErrSyncInternal.Error()
+			zcommon.WriteJSON(response, http.StatusServiceUnavailable, apiErr.NewErrorList(e))
 		} else {
 			rh.c.Log.Error().Err(err).Msg("unexpected error")
-
-			e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusInternalServerError, apiErr.NewErrorList(e))
+			response.WriteHeader(http.StatusInternalServerError)
 		}
 
 		return
@@ -511,6 +534,7 @@ type ExtensionList struct {
 // @Success 200 {object} api.ImageManifest
 // @Header  200 {string} Docker-Content-Digest "Manifest digest of the content"
 // @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable or synchronization failed"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/manifests/{reference} [get].
 func (rh *RouteHandler) GetManifest(response http.ResponseWriter, request *http.Request) {
@@ -540,9 +564,41 @@ func (rh *RouteHandler) GetManifest(response http.ResponseWriter, request *http.
 		return
 	}
 
-	content, digest, mediaType, err := getImageManifest(request.Context(), rh, imgStore, name, reference)
+	// A streamed manifest has no metaDB entry (or an older digest's) until its sync commits, so
+	// onStreamSynced counts it then; otherwise OnGetManifest below does. downloads ensures one count.
+	downloads := &downloadRecorder{}
+
+	onStreamSynced := func(syncedManifest manifest.Manifest) {
+		if rh.c.MetaDB == nil {
+			return
+		}
+
+		body, err := syncedManifest.RawBody()
+		if err != nil {
+			rh.c.Log.Err(err).Str("repository", name).Str("reference", reference).
+				Msg("failed to read synced manifest body for download stats")
+
+			return
+		}
+
+		desc := syncedManifest.GetDescriptor()
+
+		downloads.record(func() error {
+			return meta.OnGetManifest(name, reference, desc.MediaType, body,
+				rh.c.StoreController, rh.c.MetaDB, rh.c.Log)
+		})
+	}
+
+	content, digest, mediaType, streamed, err := getImageManifest(request.Context(), rh, imgStore, name, reference,
+		onStreamSynced)
 	if err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to get manifest due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -555,9 +611,10 @@ func (rh *RouteHandler) GetManifest(response http.ResponseWriter, request *http.
 			details["reference"] = reference
 			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
 			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrSyncParseRemoteRepo) {
-			e := apiErr.NewError(apiErr.DENIED).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusForbidden, apiErr.NewErrorList(e))
+		} else if errors.Is(err, zerr.ErrSyncInternal) {
+			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN)
+			e.Message = zerr.ErrSyncInternal.Error()
+			zcommon.WriteJSON(response, http.StatusServiceUnavailable, apiErr.NewErrorList(e))
 		} else {
 			rh.c.Log.Error().Err(err).Msg("unexpected error")
 			response.WriteHeader(http.StatusInternalServerError)
@@ -566,20 +623,41 @@ func (rh *RouteHandler) GetManifest(response http.ResponseWriter, request *http.
 		return
 	}
 
-	if rh.c.MetaDB != nil {
+	if rh.c.MetaDB != nil && !streamed {
 		// OnGetManifest only updates best-effort download bookkeeping (download count and
 		// last-pull timestamp). The manifest has already been retrieved and verified above, so a
 		// failure here must not fail the client's read. In particular, a burst of concurrent
 		// pulls of the same repo contends the per-repo metaDB lock and UpdateStatsOnDownload
 		// returns a lock error; turning that into a 500 discards a perfectly good manifest and
-		// causes spurious ImagePullBackOff. The hook owns logging; ignore the returned error.
-		_ = meta.OnGetManifest(name, reference, mediaType, content, rh.c.StoreController, rh.c.MetaDB, rh.c.Log)
+		// causes spurious ImagePullBackOff. The hook owns logging.
+		downloads.record(func() error {
+			return meta.OnGetManifest(name, reference, mediaType, content, rh.c.StoreController, rh.c.MetaDB, rh.c.Log)
+		})
 	}
 
 	response.Header().Set(constants.DistContentDigestKey, digest.String())
 	response.Header().Set("Content-Length", strconv.Itoa(len(content)))
 	response.Header().Set("Content-Type", mediaType)
 	zcommon.WriteData(response, http.StatusOK, mediaType, content)
+}
+
+// downloadRecorder counts a manifest GET once: in GetManifest, or after its streaming sync commits,
+// whichever succeeds first.
+type downloadRecorder struct {
+	mu       sync.Mutex
+	recorded bool
+}
+
+// record runs update unless an earlier call succeeded.
+func (d *downloadRecorder) record(update func() error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.recorded {
+		return
+	}
+
+	d.recorded = update() == nil
 }
 
 type ImageIndex struct {
@@ -615,6 +693,7 @@ func getReferrers(ctx context.Context, routeHandler *RouteHandler,
 // @Success 200 {object} api.ImageIndex
 // @Failure 400 {string} string "bad request (invalid digest)"
 // @Failure 404 {string} string "not found (manifest unknown)"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/referrers/{digest} [get].
 func (rh *RouteHandler) GetReferrers(response http.ResponseWriter, request *http.Request) {
@@ -649,6 +728,13 @@ func (rh *RouteHandler) GetReferrers(response http.ResponseWriter, request *http
 
 	referrers, err := getReferrers(request.Context(), rh, imgStore, name, digest, artifactTypes)
 	if err != nil {
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Str("name", name).Str("digest", digest.String()).
+				Msg("failed to list referrers due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrManifestNotFound) {
 			rh.c.Log.Error().Err(err).Str("name", name).Str("digest", digest.String()).
 				Msg("failed to get manifest")
@@ -694,6 +780,7 @@ func (rh *RouteHandler) GetReferrers(response http.ResponseWriter, request *http
 // @Failure 404 {string} string "not found"
 // @Failure 413 {string} string "request entity too large"
 // @Failure 414 {string} string "too many tag query parameters"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/manifests/{reference} [put].
 func (rh *RouteHandler) UpdateManifest(response http.ResponseWriter, request *http.Request) {
@@ -794,44 +881,7 @@ func (rh *RouteHandler) UpdateManifest(response http.ResponseWriter, request *ht
 
 	digest, subjectDigest, err := imgStore.PutImageManifest(ctx, name, reference, mediaType, body, digestQueryTags)
 	if err != nil {
-		details := zerr.GetDetails(err)
-		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
-			details["name"] = name
-			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrManifestNotFound) {
-			details["reference"] = reference
-			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrBadManifest) {
-			details["reference"] = reference
-			e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrManifestCacheLookup) {
-			rh.c.Log.Error().Err(err).Msg("failed to look up manifest cache before manifest write")
-			response.WriteHeader(http.StatusInternalServerError)
-		} else if errors.Is(err, zerr.ErrBlobNotFound) {
-			details["blob"] = digest.String()
-			e := apiErr.NewError(apiErr.BLOB_UNKNOWN).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-		} else if errors.Is(err, zerr.ErrImageLintAnnotations) {
-			details["reference"] = reference
-			e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-		} else {
-			// could be syscall.EMFILE (Err:0x18 too many opened files), etc
-			rh.c.Log.Error().Err(err).Msg("unexpected error, performing cleanup")
-
-			if err = imgStore.DeleteImageManifest(ctx, name, reference, false); err != nil {
-				// deletion of image manifest is important, but not critical for image repo consistency
-				// in the worst scenario a partial manifest file written to disk will not affect the repo because
-				// the new manifest was not added to "index.json" file (it is possible that GC will take care of it)
-				rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", reference).
-					Msg("couldn't remove image manifest in repo")
-			}
-
-			response.WriteHeader(http.StatusInternalServerError)
-		}
+		rh.writePutImageManifestError(response, name, reference, err)
 
 		return
 	}
@@ -868,6 +918,53 @@ func (rh *RouteHandler) UpdateManifest(response http.ResponseWriter, request *ht
 	}
 
 	response.WriteHeader(http.StatusCreated)
+}
+
+// writePutImageManifestError maps PutImageManifest failures to HTTP responses.
+// Never calls DeleteImageManifest: the PUT may not have updated index.json, and
+// deleting by reference can remove an existing tag on overwrite. Unreferenced
+// partial blobs are left for GC.
+func (rh *RouteHandler) writePutImageManifestError(
+	response http.ResponseWriter, name, reference string, err error,
+) {
+	details := zerr.GetDetails(err)
+
+	if writeStorageClassError(response, err) {
+		rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", reference).
+			Msg("failed to put manifest due to storage failure")
+
+		return
+	}
+
+	if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
+		details["name"] = name
+		e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
+	} else if errors.Is(err, zerr.ErrManifestNotFound) {
+		details["reference"] = reference
+		e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
+	} else if errors.Is(err, zerr.ErrManifestCacheLookup) {
+		rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", reference).
+			Msg("failed to look up manifest cache before manifest write")
+		response.WriteHeader(http.StatusInternalServerError)
+	} else if errors.Is(err, zerr.ErrBlobNotFound) {
+		e := apiErr.NewError(apiErr.MANIFEST_BLOB_UNKNOWN).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+	} else if errors.Is(err, zerr.ErrBadManifest) {
+		details["reference"] = reference
+		e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+	} else if errors.Is(err, zerr.ErrImageLintAnnotations) {
+		details["reference"] = reference
+		e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+	} else {
+		// e.g. io.ErrShortWrite, syscall.EMFILE — do not delete the reference
+		rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", reference).
+			Msg("unexpected error during manifest put")
+		response.WriteHeader(http.StatusInternalServerError)
+	}
 }
 
 // normalizeManifestExtraTags deduplicates tag query values in order, rejects empty components, and
@@ -910,6 +1007,7 @@ func normalizeManifestExtraTags(raw []string) ([]string, error) {
 // @Failure 404 {string} string "not found"
 // @Failure 405 {string} string "method not allowed"
 // @Failure 409 {string} string "conflict"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/manifests/{reference} [delete].
 func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *http.Request) {
@@ -947,6 +1045,12 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 	manifestBlob, manifestDigest, mediaType, err := imgStore.GetImageManifest(name, reference)
 	if err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to look up manifest for delete due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -972,6 +1076,12 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 	err = imgStore.DeleteImageManifest(ctx, name, reference, detectCollision)
 	if err != nil { //nolint: dupl
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to delete manifest due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -1110,11 +1220,17 @@ func (rh *RouteHandler) resolveBlobPresence(
 		// Mount not allowed: fall through to repo-local StatBlob.
 	}
 
-	var lockLatency time.Time
+	var ok bool
 
-	imgStore.RLock(&lockLatency)
-	ok, size, _, err := imgStore.StatBlob(repo, digest)
-	imgStore.RUnlock(&lockLatency)
+	var size int64
+
+	err := imgStore.WithRepoReadLock(repo, func() error {
+		var statErr error
+
+		ok, size, _, statErr = imgStore.StatBlob(repo, digest)
+
+		return statErr
+	})
 
 	return ok, size, err
 }
@@ -1124,6 +1240,12 @@ func (rh *RouteHandler) writeBlobReadError(
 	response http.ResponseWriter, name string, digest godigest.Digest, err error,
 ) {
 	details := zerr.GetDetails(err)
+	if writeStorageClassError(response, err) {
+		rh.c.Log.Error().Err(err).Msg("failed to read blob due to storage failure")
+
+		return
+	}
+
 	if errors.Is(err, zerr.ErrBadBlobDigest) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 		details["digest"] = digest.String()
 		e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(details)
@@ -1142,6 +1264,31 @@ func (rh *RouteHandler) writeBlobReadError(
 	}
 }
 
+// writeBlobInfoFromStreamCache answers a HEAD for a streaming blob with a local hit's headers. If
+// the blob isn't staged, it errors and writes nothing.
+func (rh *RouteHandler) writeBlobInfoFromStreamCache(repo string, digest godigest.Digest,
+	response http.ResponseWriter,
+) error {
+	streamManager := rh.c.SyncOnDemand.StreamManager()
+	if streamManager == nil {
+		return zerr.ErrStreamManagerNotInitialized
+	}
+
+	blobSize, _, err := streamManager.CachedBlobInfo(repo, digest.String())
+	if err != nil {
+		return err
+	}
+
+	// As for a local blob; ranges work on a stream too (see streamBlobRangeToClient).
+	response.Header().Set("Content-Length", strconv.FormatInt(blobSize, 10))
+	response.Header().Set("Accept-Ranges", "bytes")
+	response.Header().Set("Content-Type", constants.BinaryMediaType)
+	response.Header().Set(constants.DistContentDigestKey, digest.String())
+	response.WriteHeader(http.StatusOK)
+
+	return nil
+}
+
 // CheckBlob godoc
 // @Summary Check image blob/layer
 // @Description Check an image's blob/layer given a digest
@@ -1152,6 +1299,10 @@ func (rh *RouteHandler) writeBlobReadError(
 // @Param   digest   path    string     true        "blob/layer digest"
 // @Success 200 {object} api.ImageManifest
 // @Header  200 {string} Docker-Content-Digest "Manifest digest of the content"
+// @Failure 400 {string} string "bad request"
+// @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable"
+// @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/{digest} [head].
 func (rh *RouteHandler) CheckBlob(response http.ResponseWriter, request *http.Request) {
 	vars := mux.Vars(request)
@@ -1181,7 +1332,18 @@ func (rh *RouteHandler) CheckBlob(response http.ResponseWriter, request *http.Re
 		return
 	}
 
+	hasStreams := rh.repoHasStreams(name)
+
 	ok, blen, err := rh.resolveBlobPresence(request, imgStore, name, digest)
+	if maybeStreamingBlobPresence(hasStreams, ok, err) {
+		if streamErr := rh.writeBlobInfoFromStreamCache(name, digest, response); streamErr == nil {
+			return
+		}
+
+		// The sync commits a blob before dropping its stream: recheck storage before a 404.
+		ok, blen, err = rh.resolveBlobPresence(request, imgStore, name, digest)
+	}
+
 	if err != nil {
 		rh.writeBlobReadError(response, name, digest, err)
 
@@ -1474,6 +1636,38 @@ func (rh *RouteHandler) isBlobRedirectEnabled(repo string) bool {
 	return rh.c.Config.IsBlobRedirectEnabled(storePath)
 }
 
+// repoHasStreams reports whether repo has images staged for streaming. The blob routes call it
+// before their first storage lookup: if nothing is staged then, any manifest a client was served
+// has since been committed (or its sync failed), so a miss is a plain miss and needs neither the
+// stream lookup nor the storage recheck after it. It asks the stream manager, not the config: a
+// reload keeps the manager and its in-flight streams even if the repo no longer streams, and even
+// if sync is turned off (the controller then keeps the previous SyncOnDemand).
+func (rh *RouteHandler) repoHasStreams(repo string) bool {
+	if rh.c.SyncOnDemand == nil {
+		return false
+	}
+
+	streamManager := rh.c.SyncOnDemand.StreamManager()
+
+	return streamManager != nil && streamManager.HasStreamsForRepo(repo)
+}
+
+// maybeStreamingBlob reports whether a lookup that failed with err should try the repo's streams:
+// the blob is absent locally and the repo had streams (see repoHasStreams).
+func maybeStreamingBlob(repoHasStreams bool, err error) bool {
+	return repoHasStreams && isBlobNotFound(err)
+}
+
+// maybeStreamingBlobPresence is maybeStreamingBlob for a resolveBlobPresence result, where a
+// missing blob is !ok or a not-found error. Any other error is a storage failure: no fallback.
+func maybeStreamingBlobPresence(repoHasStreams, ok bool, err error) bool {
+	if err != nil {
+		return maybeStreamingBlob(repoHasStreams, err)
+	}
+
+	return repoHasStreams && !ok
+}
+
 func normalizeBlobRedirectURL(rawURL string) (string, bool) {
 	if strings.ContainsAny(rawURL, "\r\n") {
 		return "", false
@@ -1507,6 +1701,10 @@ func normalizeBlobRedirectURL(rawURL string) (string, bool) {
 // @Param   digest   path    string     true        "blob/layer digest"
 // @Header  200 {string} Docker-Content-Digest "Manifest digest of the content"
 // @Success 200 {object} api.ImageManifest
+// @Failure 400 {string} string "bad request"
+// @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable"
+// @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/{digest} [get].
 func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Request) {
 	vars := mux.Vars(request)
@@ -1539,13 +1737,19 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 		return
 	}
 
+	// Before any storage lookup (see repoHasStreams).
+	hasStreams := rh.repoHasStreams(name)
+
 	// Keep ranged pulls on the proxy path so zot can preserve 206 semantics.
 	if !rangeHeaderPresent && rh.isBlobRedirectEnabled(name) {
 		redirectURL, err := imgStore.GetBlobRedirectURL(request, name, digest)
 		if err != nil {
-			rh.writeBlobReadError(response, name, digest, err)
+			// May be streaming: skip the redirect; the proxy path tries the stream, then storage.
+			if !maybeStreamingBlob(hasStreams, err) {
+				rh.writeBlobReadError(response, name, digest, err)
 
-			return
+				return
+			}
 		} else if redirectURL != "" {
 			if normalizedURL, ok := normalizeBlobRedirectURL(redirectURL); ok {
 				response.Header().Set(constants.DistContentDigestKey, digest.String())
@@ -1563,6 +1767,16 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 
 	if rangeHeaderPresent {
 		ok, bsize, err := rh.resolveBlobPresence(request, imgStore, name, digest)
+		if maybeStreamingBlobPresence(hasStreams, ok, err) {
+			// Not local yet: serve the range from the blob's stream, if it has one.
+			if rh.streamBlobRangeToClient(request.Context(), response, name, digest, contentRange) {
+				return
+			}
+
+			// Not streaming either: it may have just been committed, so recheck storage.
+			ok, bsize, err = rh.resolveBlobPresence(request, imgStore, name, digest)
+		}
+
 		if err != nil {
 			rh.writeBlobReadError(response, name, digest, err)
 
@@ -1645,6 +1859,16 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 	mediaType := constants.BinaryMediaType
 
 	repo, blen, err := imgStore.GetBlob(name, digest, mediaType)
+	if err != nil && maybeStreamingBlob(hasStreams, err) {
+		// Not local yet: serve it from its stream, if any. Storage outages skip this (503/500).
+		if rh.streamBlobToClient(request.Context(), response, name, digest) {
+			return
+		}
+
+		// Not streaming either: it may have just been committed, so retry storage.
+		repo, blen, err = imgStore.GetBlob(name, digest, mediaType)
+	}
+
 	if err != nil {
 		rh.writeBlobReadError(response, name, digest, err)
 
@@ -1659,6 +1883,120 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 	WriteDataFromReader(response, http.StatusOK, blen, mediaType, repo, rh.c.Log)
 }
 
+// streamBlobToClient serves digest from its stream as it downloads. It returns false, writing
+// nothing, if there is no stream or its download never starts.
+func (rh *RouteHandler) streamBlobToClient(ctx context.Context, response http.ResponseWriter, repo string,
+	digest godigest.Digest,
+) bool {
+	streamManager := rh.c.SyncOnDemand.StreamManager()
+	if streamManager == nil {
+		return false
+	}
+
+	copier, err := streamManager.ConnectClient(repo, digest.String(), response)
+	if err != nil {
+		return false
+	}
+
+	// Wait for the download to start before writing headers, so a failure can still fall through.
+	desc, err := copier.Descriptor(ctx)
+	if err != nil {
+		rh.logStreamWaitErr(ctx, err, repo, digest, "failed to wait for streamed blob to become ready")
+
+		// Copy won't run, so release the subscription ConnectClient took.
+		copier.Close()
+
+		return false
+	}
+
+	// BinaryMediaType, like every non-streaming blob response.
+	response.Header().Set("Content-Length", strconv.FormatInt(desc.Size, 10))
+	response.Header().Set(constants.DistContentDigestKey, digest.String())
+	response.Header().Set("Content-Type", constants.BinaryMediaType)
+	response.WriteHeader(http.StatusOK)
+
+	if err := copier.Copy(); err != nil {
+		rh.c.Log.Error().Err(err).Str("repo", repo).Str("digest", digest.String()).
+			Msg("error while streaming blob to client")
+	}
+
+	return true
+}
+
+// logStreamWaitErr logs a failed wait for a stream to start; a client leaving is debug-level.
+func (rh *RouteHandler) logStreamWaitErr(ctx context.Context, err error, repo string, digest godigest.Digest,
+	msg string,
+) {
+	event := rh.c.Log.Error()
+	if ctx.Err() != nil {
+		event = rh.c.Log.Debug()
+	}
+
+	event.Err(err).Str("repo", repo).Str("digest", digest.String()).Msg(msg)
+}
+
+// streamBlobRangeToClient serves a single-range 206 from digest's stream. It returns false, writing
+// nothing, if there is no stream or its download never starts. Multi-range requests get the whole
+// blob with a 200 (allowed by RFC 9110 section 14.2). The size is known from the staged manifest,
+// so a bad range gets a 416 at once.
+func (rh *RouteHandler) streamBlobRangeToClient(ctx context.Context,
+	response http.ResponseWriter, repo string, digest godigest.Digest, contentRange string,
+) bool {
+	streamManager := rh.c.SyncOnDemand.StreamManager()
+	if streamManager == nil {
+		return false
+	}
+
+	size, _, err := streamManager.CachedBlobInfo(repo, digest.String())
+	if err != nil {
+		return false
+	}
+
+	ranges, err := parseRangeHeader(contentRange, size)
+	if err != nil {
+		response.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+
+		return true
+	}
+
+	if len(ranges) > 1 {
+		return rh.streamBlobToClient(ctx, response, repo, digest)
+	}
+
+	rng := ranges[0]
+
+	copier, err := streamManager.ConnectClient(repo, digest.String(), response)
+	if err != nil {
+		return false
+	}
+
+	// Wait for the download to start before writing the 206; after it, a failure means a truncated
+	// body.
+	if _, err := copier.Descriptor(ctx); err != nil {
+		rh.logStreamWaitErr(ctx, err, repo, digest, "failed to wait for streamed blob range to become ready")
+
+		// CopyRange won't run, so release the subscription ConnectClient took.
+		copier.Close()
+
+		return false
+	}
+
+	// BinaryMediaType, like every non-streaming blob response.
+	response.Header().Set(constants.DistContentDigestKey, digest.String())
+	response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, size))
+	response.Header().Set("Content-Length", strconv.FormatInt(rng.length(), 10))
+	response.Header().Set("Content-Type", constants.BinaryMediaType)
+	response.WriteHeader(http.StatusPartialContent)
+
+	if err := copier.CopyRange(rng.start, rng.end); err != nil {
+		rh.c.Log.Error().Err(err).Str("repo", repo).Str("digest", digest.String()).
+			Msg("error while streaming blob range to client")
+	}
+
+	return true
+}
+
 // DeleteBlob godoc
 // @Summary Delete image blob/layer
 // @Description Delete an image's blob/layer given a digest
@@ -1667,6 +2005,10 @@ func (rh *RouteHandler) GetBlob(response http.ResponseWriter, request *http.Requ
 // @Param   name      path    string     true        "repository name"
 // @Param   digest    path    string     true        "blob/layer digest"
 // @Success 202 "accepted"
+// @Failure 404 {string} string "not found"
+// @Failure 405 {string} string "method not allowed"
+// @Failure 503 {string} string "storage temporarily unavailable"
+// @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/{digest} [delete].
 func (rh *RouteHandler) DeleteBlob(response http.ResponseWriter, request *http.Request) {
 	vars := mux.Vars(request)
@@ -1692,6 +2034,12 @@ func (rh *RouteHandler) DeleteBlob(response http.ResponseWriter, request *http.R
 	err = imgStore.DeleteBlob(name, digest)
 	if err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to delete blob due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrBadBlobDigest) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["digest"] = digest.String()
 			e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(details)
@@ -1740,6 +2088,7 @@ func (rh *RouteHandler) DeleteBlob(response http.ResponseWriter, request *http.R
 // @Failure 401 {string} string "unauthorized"
 // @Failure 404 {string} string "not found"
 // @Failure 415 {string} string "unsupported media type (monolithic upload requires application/octet-stream)"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads [post].
 func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -1794,6 +2143,12 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 			upload, err := imgStore.NewBlobUpload(ctx, name)
 			if err != nil {
 				details := zerr.GetDetails(err)
+				if writeStorageClassError(response, err) {
+					rh.c.Log.Error().Err(err).Msg("failed to start blob upload due to storage failure")
+
+					return
+				}
+
 				if errors.Is(err, zerr.ErrRepoNotFound) {
 					details["name"] = name
 					e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -1884,6 +2239,10 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 
 			rh.c.Log.Error().Err(err).Int64("actual", size).Int64("expected", contentLength).
 				Msg("failed to full blob upload")
+			if writeStorageClassError(response, err) {
+				return
+			}
+
 			response.WriteHeader(http.StatusInternalServerError)
 
 			return
@@ -1906,6 +2265,12 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 	upload, err := imgStore.NewBlobUpload(ctx, name)
 	if err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to start blob upload due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrRepoNotFound) {
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -1935,6 +2300,7 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 // @Header  204 {string} Range "0-128"
 // @Failure 400 {string} string "bad request"
 // @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads/{session_id} [get].
 func (rh *RouteHandler) GetBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -1959,6 +2325,12 @@ func (rh *RouteHandler) GetBlobUpload(response http.ResponseWriter, request *htt
 	size, err := imgStore.GetBlobUpload(name, sessionID)
 	if err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to read blob upload due to storage failure")
+
+			return
+		}
+
 		//nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 		if errors.Is(err, zerr.ErrBadBlobDigest) {
 			details["session_id"] = sessionID
@@ -2005,6 +2377,7 @@ func (rh *RouteHandler) GetBlobUpload(response http.ResponseWriter, request *htt
 // @Failure 400 {string} string "bad request"
 // @Failure 404 {string} string "not found"
 // @Failure 416 {string} string "range not satisfiable"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads/{session_id} [patch].
 func (rh *RouteHandler) PatchBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -2058,6 +2431,11 @@ func (rh *RouteHandler) PatchBlobUpload(response http.ResponseWriter, request *h
 
 	if err != nil { //nolint: dupl
 		details := zerr.GetDetails(err)
+		if rh.writeBlobUploadStorageError(response, err, imgStore, name, sessionID,
+			"failed to patch blob upload due to storage failure") {
+			return
+		}
+
 		if errors.Is(err, zerr.ErrBadUploadRange) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["session_id"] = sessionID
 			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
@@ -2111,6 +2489,7 @@ func (rh *RouteHandler) PatchBlobUpload(response http.ResponseWriter, request *h
 // @Failure 400 {string} string "bad request"
 // @Failure 404 {string} string "not found"
 // @Failure 416 {string} string "range not satisfiable"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads/{session_id} [put].
 func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -2200,6 +2579,11 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 		_, err = imgStore.PutBlobChunk(ctx, name, sessionID, from, to, request.Body)
 		if err != nil { //nolint:dupl
 			details := zerr.GetDetails(err)
+			if rh.writeBlobUploadStorageError(response, err, imgStore, name, sessionID,
+				"failed to update blob upload due to storage failure") {
+				return
+			}
+
 			if errors.Is(err, zerr.ErrBadUploadRange) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 				details["session_id"] = sessionID
 				e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
@@ -2231,6 +2615,11 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 	// blob chunks already transferred, just finish
 	if err := imgStore.FinishBlobUpload(name, sessionID, request.Body, digest); err != nil {
 		details := zerr.GetDetails(err)
+		if rh.writeBlobUploadStorageError(response, err, imgStore, name, sessionID,
+			"failed to finish blob upload due to storage failure") {
+			return
+		}
+
 		if errors.Is(err, zerr.ErrBadBlobDigest) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["digest"] = digest.String()
 			e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(details)
@@ -2277,6 +2666,7 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 // @Param   session_id   path    string     true        "upload session_id"
 // @Success 204 "no content"
 // @Failure 404 {string} string "not found"
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/{name}/blobs/uploads/{session_id} [delete].
 func (rh *RouteHandler) DeleteBlobUpload(response http.ResponseWriter, request *http.Request) {
@@ -2300,6 +2690,12 @@ func (rh *RouteHandler) DeleteBlobUpload(response http.ResponseWriter, request *
 
 	if err := imgStore.DeleteBlobUpload(name, sessionID); err != nil {
 		details := zerr.GetDetails(err)
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to delete blob upload due to storage failure")
+
+			return
+		}
+
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
@@ -2404,6 +2800,7 @@ func (rh *RouteHandler) listStorageRepositories(lastEntry string, maxEntries int
 // @Accept  json
 // @Produce json
 // @Success 200 {object} api.RepositoryList
+// @Failure 503 {string} string "storage temporarily unavailable"
 // @Failure 500 {string} string "internal server error"
 // @Router /v2/_catalog [get].
 func (rh *RouteHandler) ListRepositories(response http.ResponseWriter, request *http.Request) {
@@ -2428,8 +2825,32 @@ func (rh *RouteHandler) ListRepositories(response http.ResponseWriter, request *
 		return
 	}
 
+	if rh.c.Config.CopyAccessControlConfig().IsAnonymousCatalogDisabled() {
+		// traditional bearer tokens never set a username, so also consult the authn context
+		authenticated := !userAc.IsAnonymous()
+		if !authenticated {
+			authnMwCtx, err := reqCtx.GetAuthnMiddlewareContext(request.Context())
+			authenticated = err == nil && authnMwCtx != nil && authnMwCtx.AuthnType == BEARER
+		}
+
+		if !authenticated {
+			authConfig := rh.c.Config.CopyAuthConfig()
+			authzFailWithReason(response, request, "", authConfig, rh.c.Config.GetRealm(),
+				authConfig.GetFailDelay(), "")
+
+			return
+		}
+	}
+
 	repos, moreEntries, err := rh.listStorageRepositories(lastEntry, maxEntries, userAc)
 	if err != nil {
+		if writeStorageClassError(response, err) {
+			rh.c.Log.Error().Err(err).Msg("failed to list repositories due to storage failure")
+
+			return
+		}
+
+		rh.c.Log.Error().Err(err).Msg("unexpected error listing repositories")
 		response.WriteHeader(http.StatusInternalServerError)
 
 		return
@@ -2751,9 +3172,15 @@ func (rh *RouteHandler) getImageStore(name string) storageTypes.ImageStore {
 }
 
 // will sync on demand if an image is not found, in case sync extensions is enabled.
+//
+// onStreamSynced, if non-nil, runs once the streaming sync serving this call commits (GetManifest
+// counts the download there; HEAD passes nil).
+//
+// streamed means the manifest is upstream's and not committed yet, so local metadata for reference
+// may still describe an older digest.
 func getImageManifest(ctx context.Context, routeHandler *RouteHandler, imgStore storageTypes.ImageStore, name,
-	reference string,
-) ([]byte, godigest.Digest, string, error) {
+	reference string, onStreamSynced func(manifest.Manifest),
+) ([]byte, godigest.Digest, string, bool, error) {
 	syncEnabled := isSyncOnDemandEnabled(routeHandler.c)
 
 	_, digestErr := godigest.Parse(reference)
@@ -2761,17 +3188,24 @@ func getImageManifest(ctx context.Context, routeHandler *RouteHandler, imgStore 
 		// if it's a digest then return local cached image, if not found and sync enabled, then try to sync
 		content, digest, mediaType, err := imgStore.GetImageManifest(name, reference)
 		if err == nil || !syncEnabled {
-			return content, digest, mediaType, err
+			return content, digest, mediaType, false, err
 		}
 
-		if routeHandler.c.SyncOnDemand.ShouldQueueOnDemandSync(name) {
+		// A digest still being streamed falls through to join that stream (see inFlightStream).
+		if routeHandler.c.SyncOnDemand.ShouldQueueOnDemandSync(name) &&
+			!isStreamingReference(routeHandler.c, name, reference) {
 			if isManifestNotFound(err) {
 				routeHandler.c.SyncOnDemand.QueueImage(ctx, name, reference)
 			}
 
-			return content, digest, mediaType, err
+			return content, digest, mediaType, false, err
 		}
 	}
+
+	var syncErr error
+
+	// synced: FetchManifestForStream already ran the sync, without streaming.
+	var synced bool
 
 	if syncEnabled {
 		// When manifestCheckInterval is configured and a recent upstream check already
@@ -2783,14 +3217,20 @@ func getImageManifest(ctx context.Context, routeHandler *RouteHandler, imgStore 
 				routeHandler.c.Log.Debug().Str("repository", name).Str("reference", reference).
 					Msg("manifest check interval has not elapsed, serving local manifest")
 
-				return content, digest, mediaType, nil
+				return content, digest, mediaType, false, nil
 			}
 		}
 
-		if routeHandler.c.SyncOnDemand.ShouldQueueOnDemandSync(name) {
+		// A reference still being streamed, possibly by a sync from before a config reload that no
+		// longer streams this repo (or made it background-only): join that stream. Starting a second
+		// sync of the same tag beside it would download it twice, and if the tag moved upstream, the
+		// older sync (pinned to the digest it served) could commit last and roll the tag back.
+		inFlightStream := isStreamingReference(routeHandler.c, name, reference)
+
+		if !inFlightStream && routeHandler.c.SyncOnDemand.ShouldQueueOnDemandSync(name) {
 			content, digest, mediaType, err := imgStore.GetImageManifest(name, reference)
 			if err == nil {
-				return content, digest, mediaType, nil
+				return content, digest, mediaType, false, nil
 			}
 
 			if isManifestNotFound(err) {
@@ -2799,25 +3239,144 @@ func getImageManifest(ctx context.Context, routeHandler *RouteHandler, imgStore 
 				routeHandler.c.SyncOnDemand.QueueImage(ctx, name, reference)
 			}
 
-			return content, digest, mediaType, err
+			return content, digest, mediaType, false, err
 		}
 
-		routeHandler.c.Log.Info().Str("repository", name).Str("reference", reference).
-			Msg("trying to get updated image by syncing on demand")
+		// Streaming: return the upstream manifest now and sync the image in the background,
+		// instead of blocking on SyncImage below.
+		if inFlightStream || routeHandler.c.SyncOnDemand.IsStreamingEnabledForRepo(name) {
+			routeHandler.c.Log.Debug().Str("repository", name).Str("reference", reference).
+				Bool("inFlightStream", inFlightStream).
+				Msg("streaming enabled for repo, fetching manifest directly from upstream")
 
-		if errSync := routeHandler.c.SyncOnDemand.SyncImage(ctx, name, reference); errSync != nil {
-			routeHandler.c.Log.Err(errSync).Str("repository", name).Str("reference", reference).
+			fetchedManifest, errFetch := routeHandler.c.SyncOnDemand.FetchManifestForStream(ctx, name, reference,
+				onStreamSynced)
+			if errFetch == nil {
+				content, err := fetchedManifest.RawBody()
+				if err != nil {
+					routeHandler.c.Log.Err(err).Str("repository", name).Str("reference", reference).
+						Msg("failed to read fetched manifest body")
+
+					content, digest, mediaType, err := imgStore.GetImageManifest(name, reference)
+
+					return content, digest, mediaType, false, err
+				}
+
+				desc := fetchedManifest.GetDescriptor()
+
+				return content, desc.Digest, desc.MediaType, true, nil
+			}
+
+			// Not streamed: FetchManifestForStream already waited for the sync, so read storage
+			// below and map its error as after SyncImage.
+			if errors.Is(errFetch, zerr.ErrSyncNotStreamed) {
+				synced = true
+
+				// The bare sentinel means the sync succeeded; otherwise it wraps the sync's error.
+				if errFetch != zerr.ErrSyncNotStreamed { //nolint:errorlint,err113 // identity check, see above
+					syncErr = errFetch
+				}
+			} else if ctxErr := ctx.Err(); ctxErr != nil {
+				// Client gone; the sync goes on. Don't wait on it again via SyncImage.
+				return nil, "", "", false, ctxErr
+			} else {
+				routeHandler.c.Log.Err(errFetch).Str("repository", name).Str("reference", reference).
+					Msg("failed to fetch manifest for stream, falling back to non-streaming on-demand sync")
+			}
+		}
+
+		if !synced {
+			routeHandler.c.Log.Info().Str("repository", name).Str("reference", reference).
+				Msg("trying to get updated image by syncing on demand")
+
+			syncErr = routeHandler.c.SyncOnDemand.SyncImage(ctx, name, reference)
+		}
+
+		if syncErr != nil {
+			routeHandler.c.Log.Err(syncErr).Str("repository", name).Str("reference", reference).
 				Msg("failed to sync image")
 		}
 	}
 
-	return imgStore.GetImageManifest(name, reference)
+	content, digest, mediaType, localErr := imgStore.GetImageManifest(name, reference)
+	if localErr == nil {
+		return content, digest, mediaType, false, nil
+	}
+
+	// A real local storage failure must not be masked by a sync error.
+	if !isManifestNotFound(localErr) {
+		return nil, "", "", false, localErr
+	}
+
+	// SyncImage returns opaque ErrSyncInternal for hard failures. Soft misses
+	// stay as filter/not-found and must remain a client 404.
+	if errors.Is(syncErr, zerr.ErrSyncInternal) {
+		return nil, "", "", false, syncErr
+	}
+
+	return nil, "", "", false, localErr
+}
+
+// writeStorageClassError maps local storage classes to HTTP status codes:
+// Transient → 503 (retryable), Permanent → 500. Returns true if a response was written.
+// Call before not-found sentinels so a classed outage cannot surface as 404.
+func writeStorageClassError(response http.ResponseWriter, err error) bool {
+	if errors.Is(err, zerr.ErrStorageTransient) {
+		response.WriteHeader(http.StatusServiceUnavailable)
+
+		return true
+	}
+
+	if errors.Is(err, zerr.ErrStoragePermanent) {
+		response.WriteHeader(http.StatusInternalServerError)
+
+		return true
+	}
+
+	return false
+}
+
+// writeBlobUploadStorageError maps Transient→503 and Permanent→500 for in-progress
+// blob upload write failures. Permanent also deletes the upload session so a capacity
+// failure (EDQUOT/ENOSPC) cannot leave a leftover that fills the volume. Transient
+// keeps the session so a client can retry the same upload.
+func (rh *RouteHandler) writeBlobUploadStorageError(
+	response http.ResponseWriter, err error, imgStore storageTypes.ImageStore, repo, sessionID, logMsg string,
+) bool {
+	if !writeStorageClassError(response, err) {
+		return false
+	}
+
+	if errors.Is(err, zerr.ErrStoragePermanent) {
+		rh.c.Log.Error().Err(err).Msg(logMsg + ", removing .uploads/ files")
+
+		if delErr := imgStore.DeleteBlobUpload(repo, sessionID); delErr != nil {
+			rh.c.Log.Error().Err(delErr).Str("blobUpload", sessionID).Str("repository", repo).
+				Msg("failed to remove blobUpload in repo")
+		}
+	} else {
+		rh.c.Log.Error().Err(err).Msg(logMsg)
+	}
+
+	return true
 }
 
 // isManifestNotFound reports whether err means the repo or manifest is absent locally
-// (safe to trigger background sync) rather than a storage or other failure.
+// (safe to treat as a client miss / queue background sync). Storage Transient/
+// Permanent outages are never "not found", even when ImageStore also wraps a
+// not-found sentinel. True absence may still carry ErrRepoNotFound (optionally
+// with ErrStorageMissing).
 func isManifestNotFound(err error) bool {
+	if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+		return false
+	}
+
 	return errors.Is(err, zerr.ErrRepoNotFound) || errors.Is(err, zerr.ErrManifestNotFound)
+}
+
+// isBlobNotFound reports whether err means the repo or blob is absent locally.
+func isBlobNotFound(err error) bool {
+	return errors.Is(err, zerr.ErrRepoNotFound) || errors.Is(err, zerr.ErrBlobNotFound)
 }
 
 type APIKeyPayload struct { //nolint:revive,gosec
@@ -3032,6 +3591,20 @@ func getBlobUploadLocation(url *url.URL, name string, digest godigest.Digest) st
 	}
 
 	return url.String()
+}
+
+// isStreamingReference reports whether repo:reference is staged for streaming in the stream manager,
+// which a reload keeps (see EnableSyncExtension) even if the new config no longer streams repo.
+// FetchManifestForStream joins such a stream, and falls back to a plain sync if it just ended.
+func isStreamingReference(ctlr *Controller, repo, reference string) bool {
+	streamManager := ctlr.SyncOnDemand.StreamManager()
+	if streamManager == nil {
+		return false
+	}
+
+	_, staged := streamManager.StreamingImageManifest(repo, reference)
+
+	return staged
 }
 
 func isSyncOnDemandEnabled(ctlr *Controller) bool {

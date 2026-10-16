@@ -6,6 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/regclient/regclient"
@@ -79,6 +82,8 @@ func (registry *RemoteRegistry) getRepoList(ctx context.Context, hostname string
 	}
 
 	last := ""
+	seen := map[string]struct{}{}
+	linkPagination := false
 
 	for {
 		repoOpts := []scheme.RepoOpts{}
@@ -97,16 +102,111 @@ func (registry *RemoteRegistry) getRepoList(ctx context.Context, hostname string
 			return repositories, err
 		}
 
-		if len(repoList) == 0 || last == repoList[len(repoList)-1] {
-			break
+		headers, _ := clientRepoList.RawHeaders() // never returns an error
+
+		// Follow the Link header cursor: registries such as AWS ECR use an opaque
+		// token there and reject a repository name as `last`.
+		next, hasLink := nextCatalogLast(headers)
+
+		switch {
+		case hasLink:
+			linkPagination = true
+		case linkPagination: // no rel="next": last page
+			return append(repositories, repoList...), nil
+		case len(repoList) == 0, last == repoList[len(repoList)-1]:
+			return repositories, nil
+		default: // no rel="next" link seen: use the last repository name as the cursor
+			next = repoList[len(repoList)-1]
 		}
 
 		repositories = append(repositories, repoList...)
 
-		last = repoList[len(repoList)-1]
+		if next == "" {
+			registry.log.Warn().Str("remote", hostname).
+				Msg("catalog next link has no last parameter, repository list may be incomplete")
+
+			return repositories, nil
+		}
+
+		if _, ok := seen[next]; ok {
+			return repositories, nil
+		}
+
+		seen[next] = struct{}{}
+		last = next
+	}
+}
+
+// nextCatalogLast returns the `last` query parameter of the rel="next" Link, if any.
+func nextCatalogLast(headers http.Header) (string, bool) {
+	for _, value := range headers.Values("Link") {
+		for _, link := range splitLinkHeader(value, ',') {
+			params := splitLinkHeader(link, ';')
+			target := strings.TrimSpace(params[0])
+
+			if len(target) < 2 || target[0] != '<' || target[len(target)-1] != '>' || !hasNextRel(params[1:]) {
+				continue
+			}
+
+			// An unusable query yields "", which the caller reports as a missing cursor.
+			_, rawQuery, _ := strings.Cut(target[1:len(target)-1], "?")
+			query, _ := url.ParseQuery(rawQuery)
+
+			return query.Get("last"), true
+		}
 	}
 
-	return repositories, nil
+	return "", false
+}
+
+// hasNextRel reports whether the first rel link-param (RFC 8288 section 3.3) includes "next".
+func hasNextRel(params []string) bool {
+	for _, param := range params {
+		name, value, _ := strings.Cut(param, "=")
+		if !strings.EqualFold(strings.TrimSpace(name), "rel") {
+			continue
+		}
+
+		for rel := range strings.FieldsSeq(strings.Trim(strings.TrimSpace(value), `"`)) {
+			if strings.EqualFold(rel, "next") {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return false
+}
+
+// splitLinkHeader splits a Link header on sep, ignoring separators inside <URI> and quoted strings.
+func splitLinkHeader(value string, sep byte) []string {
+	var (
+		parts                  []string
+		start                  int
+		inURI, quoted, escaped bool
+	)
+
+	for i := range len(value) {
+		switch char := value[i]; {
+		case escaped:
+			escaped = false
+		case quoted:
+			escaped = char == '\\'
+			quoted = char != '"'
+		case inURI:
+			inURI = char != '>'
+		case char == '"':
+			quoted = true
+		case char == '<':
+			inURI = true
+		case char == sep:
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+	}
+
+	return append(parts, value[start:])
 }
 
 func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.Ref, error) {
@@ -122,6 +222,13 @@ func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.R
 
 	imageRef, err := ref.New(imageRefPath)
 	if err != nil {
+		// Unusable configured host (empty, absolute path, …) is a registry config
+		// failure → ErrSyncParseRemoteRepo (weak). Client/reference parse failures
+		// stay as ErrInvalidReference (soft on-demand miss → 404, not opaque 503).
+		if isInvalidRemoteHost(registry.primaryHost) {
+			return ref.Ref{}, fmt.Errorf("%w: %w", zerr.ErrSyncParseRemoteRepo, err)
+		}
+
 		return ref.Ref{}, err
 	}
 
@@ -132,6 +239,17 @@ func (registry *RemoteRegistry) GetImageReference(repo, reference string) (ref.R
 	// add check for imageref to be oci
 
 	return imageRef, nil
+}
+
+// isInvalidRemoteHost reports whether host cannot form any valid registry image
+// reference, independent of the client repo/tag.
+func isInvalidRemoteHost(host string) bool {
+	// ref.New returns the same ErrInvalidReference for a bad host and a bad
+	// client repo/tag, so probe with a fixed valid path: if this fails, the
+	// host itself is unusable; if it succeeds, a later failure is the client ref.
+	_, err := ref.New(host + "/library/probe:latest")
+
+	return err != nil
 }
 
 // mapRegclientManifestErr maps regclient manifest fetch failures to zot errors so
@@ -157,13 +275,17 @@ func mapRegclientManifestErr(err error) error {
 // translateManifestErr maps regclient manifest fetch errors to zot errors for sync/on-demand callers.
 func (registry *RemoteRegistry) translateManifestErr(imageReference ref.Ref, err error) error {
 	mapped := mapRegclientManifestErr(err)
-	if errors.Is(mapped, err) {
-		return err
-	}
 
-	registry.log.Info().Str("errorType", common.TypeOf(err)).
-		Str("repository", imageReference.Repository).Str("reference", imageReference.Reference).
-		Err(err).Msg("failed to get remote manifest")
+	// Log when mapRegclientManifestErr introduced a zot sentinel. Identity "=="
+	// is forbidden by err113; detect remapping by sentinel presence on mapped
+	// that was absent on err.
+	remapped := (errors.Is(mapped, zerr.ErrUnauthorizedAccess) && !errors.Is(err, zerr.ErrUnauthorizedAccess)) ||
+		(errors.Is(mapped, zerr.ErrManifestNotFound) && !errors.Is(err, zerr.ErrManifestNotFound))
+	if remapped {
+		registry.log.Info().Str("errorType", common.TypeOf(err)).
+			Str("repository", imageReference.Repository).Str("reference", imageReference.Reference).
+			Err(err).Msg("failed to get remote manifest")
+	}
 
 	return mapped
 }

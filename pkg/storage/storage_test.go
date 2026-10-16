@@ -66,6 +66,52 @@ var DeleteReferrers = config.ImageRetention{ //nolint: gochecknoglobals
 	},
 }
 
+func TestCheckIsImageSignatureCosignTag(t *testing.T) {
+	manifestBlob, err := json.Marshal(ispec.Manifest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	Convey("CheckIsImageSignature validates legacy cosign tags", t, func() {
+		Convey("a short cosign-looking tag is not a signature", func() {
+			isSignature, signatureType, digest, err := storage.CheckIsImageSignature(
+				"repo", manifestBlob, "sha256-abc.sig")
+			So(err, ShouldBeNil)
+			So(isSignature, ShouldBeFalse)
+			So(signatureType, ShouldBeEmpty)
+			So(digest, ShouldBeEmpty)
+		})
+
+		Convey("an overlong cosign-looking tag is not a signature", func() {
+			tag := "sha256-" + strings.Repeat("a", 65) + ".sig"
+			isSignature, signatureType, digest, err := storage.CheckIsImageSignature("repo", manifestBlob, tag)
+			So(err, ShouldBeNil)
+			So(isSignature, ShouldBeFalse)
+			So(signatureType, ShouldBeEmpty)
+			So(digest, ShouldBeEmpty)
+		})
+
+		Convey("a non-hex digest of the expected length is not a signature", func() {
+			tag := "sha256-" + strings.Repeat("z", 64) + ".sig"
+			isSignature, signatureType, digest, err := storage.CheckIsImageSignature("repo", manifestBlob, tag)
+			So(err, ShouldBeNil)
+			So(isSignature, ShouldBeFalse)
+			So(signatureType, ShouldBeEmpty)
+			So(digest, ShouldBeEmpty)
+		})
+
+		Convey("a valid cosign tag identifies its signed manifest", func() {
+			signedDigest := godigest.FromString("signed-image")
+			tag := "sha256-" + signedDigest.Encoded() + ".sig"
+			isSignature, signatureType, digest, err := storage.CheckIsImageSignature("repo", manifestBlob, tag)
+			So(err, ShouldBeNil)
+			So(isSignature, ShouldBeTrue)
+			So(signatureType, ShouldEqual, storage.CosignType)
+			So(digest, ShouldEqual, signedDigest)
+		})
+	})
+}
+
 func cleanupStorage(store storageTypes.Driver, name string) {
 	if store != nil {
 		_ = store.Delete(name)
@@ -295,6 +341,44 @@ func TestStorageNew(t *testing.T) {
 
 		_, err := storage.New(conf, nil, nil, zlog.NewTestLogger(), nil)
 		So(err, ShouldNotBeNil)
+	})
+}
+
+// TestStorageNewDefaultStoreCreateFails covers the nil-check guards around the image-store
+// constructors: imagestore.NewImageStore returns nil (not an error) when it can't create its
+// root dir, so New/getSubStore must translate that into ErrDefaultImgStoreCreate/
+// ErrSubpathImgStoreCreate instead of handing callers a nil ImageStore.
+func TestStorageNewDefaultStoreCreateFails(t *testing.T) {
+	Convey("New returns ErrDefaultImgStoreCreate when the root dir can't be created", t, func() {
+		// A regular file as an ancestor of RootDirectory makes MkdirAll fail with ENOTDIR,
+		// regardless of the test process' privileges (unlike permission-bit failures).
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		So(os.WriteFile(blocker, []byte(""), 0o600), ShouldBeNil)
+
+		conf := config.New()
+		conf.Storage.RootDirectory = filepath.Join(blocker, "root")
+
+		_, err := storage.New(conf, nil, nil, zlog.NewTestLogger(), nil)
+		So(err, ShouldEqual, zerr.ErrDefaultImgStoreCreate)
+	})
+}
+
+func TestGetSubStoreCreateFails(t *testing.T) {
+	Convey("getSubStore returns ErrSubpathImgStoreCreate when a subpath root dir can't be created", t, func() {
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		So(os.WriteFile(blocker, []byte(""), 0o600), ShouldBeNil)
+
+		conf := &config.Config{
+			Storage: config.GlobalStorageConfig{
+				StorageConfig: config.StorageConfig{RootDirectory: t.TempDir()},
+				SubPaths: map[string]config.StorageConfig{
+					"a/": {RootDirectory: filepath.Join(blocker, "sub")},
+				},
+			},
+		}
+
+		_, err := storage.New(conf, nil, nil, zlog.NewTestLogger(), nil)
+		So(errors.Is(err, zerr.ErrSubpathImgStoreCreate), ShouldBeTrue)
 	})
 }
 
@@ -1774,20 +1858,14 @@ func TestStorageAPIs(t *testing.T) {
 						wg.Add(2)
 
 						go func() {
-							var lockLatency time.Time
-
 							defer wg.Done()
-							imgStore.Lock(&lockLatency)
-							func() {}()
-							imgStore.Unlock(&lockLatency)
+
+							_ = imgStore.WithRepoLock("test", func() error { return nil })
 						}()
 						go func() {
-							var lockLatency time.Time
-
 							defer wg.Done()
-							imgStore.RLock(&lockLatency)
-							func() {}()
-							imgStore.RUnlock(&lockLatency)
+
+							_ = imgStore.WithRepoReadLock("test", func() error { return nil })
 						}()
 					}
 
@@ -2658,7 +2736,7 @@ func TestReuploadCorruptedBlob(t *testing.T) {
 				ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 				So(ok, ShouldBeFalse)
 				So(size, ShouldNotEqual, blobSize)
-				So(err, ShouldEqual, zerr.ErrBlobNotFound)
+				So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 				err = WriteImageToFileSystem(image, repoName, tag, storeController)
 				So(err, ShouldBeNil)
@@ -2700,7 +2778,7 @@ func TestReuploadCorruptedBlob(t *testing.T) {
 				ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 				So(ok, ShouldBeFalse)
 				So(size, ShouldNotEqual, blobSize)
-				So(err, ShouldEqual, zerr.ErrBlobNotFound)
+				So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 				err = WriteMultiArchImageToFileSystem(image, repoName, tag, storeController)
 				So(err, ShouldBeNil)
@@ -5232,8 +5310,8 @@ func TestPutIndexContent_atomicReplace(t *testing.T) {
 //  1. A genuine empty blob uploaded via the normal path returns (true, 0, nil).
 //  2. StatBlob on the same genuine empty blob also returns (true, 0, ...).
 //  3. A zero-size file planted at a blob path whose digest does NOT match the
-//     hash of empty content (simulating an S3-style deduplication placeholder
-//     without a backing cache entry) is reported as not found.
+//     hash of empty content is reported as not found: such a copy is never
+//     served, whichever storage it is on.
 func TestCheckBlobEmptyBlob(t *testing.T) {
 	const repo = "empty-blob-test"
 
@@ -5310,7 +5388,9 @@ func TestCheckBlobEmptyBlob(t *testing.T) {
 	ok, size, err = imgStore.CheckBlob(ctx, repo, nonEmptyDigest)
 	assertExpectation(ok, ShouldBeFalse)
 	assertExpectation(size, ShouldEqual, int64(-1))
-	assertExpectation(err, ShouldEqual, zerr.ErrBlobNotFound)
+	if !errors.Is(err, zerr.ErrBlobNotFound) {
+		t.Fatalf("expected ErrBlobNotFound, got %v", err)
+	}
 }
 
 func TestCheckIsImageSignature(t *testing.T) {
@@ -5387,4 +5467,103 @@ func TestCheckIsImageSignature(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 	})
+}
+
+// TestCloudRemoteCacheDedupePreservesLateOrigin reproduces the issue-4463 setup:
+// remote object store + redis cache + dedupe, late-sorting repo holds the origin,
+// early-sorting repo is a stub; a startup-style dedupe walk must not empty the origin.
+func TestCloudRemoteCacheDedupePreservesLateOrigin(t *testing.T) {
+	cases := []struct {
+		name        string
+		storageType string
+	}{
+		{name: "S3_Redis", storageType: storageConstants.S3StorageDriverName},
+		{name: "Azure_Redis", storageType: storageConstants.AzureStorageDriverName},
+	}
+
+	for _, testcase := range cases {
+		t.Run(testcase.name, func(t *testing.T) {
+			switch testcase.storageType {
+			case storageConstants.S3StorageDriverName:
+				tskip.SkipS3(t)
+			case storageConstants.AzureStorageDriverName:
+				tskip.SkipAzure(t)
+			}
+
+			miniRedis := miniredis.RunT(t)
+			redisAddr := "redis://" + miniRedis.Addr()
+			defer DumpKeys(t, redisAddr)
+
+			uuid, err := guuid.NewV4()
+			if err != nil {
+				panic(err)
+			}
+
+			testDir := path.Join("/oci-repo-test", uuid.String())
+			cacheDir := t.TempDir()
+
+			opts := createObjectStoreOpts{
+				rootDir:       testDir,
+				cacheDir:      cacheDir,
+				cacheType:     storageConstants.RedisDriverName,
+				storageType:   testcase.storageType,
+				miniRedisAddr: redisAddr,
+			}
+
+			store, imgStore, _, err := createObjectsStore(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cleanupRoot := testDir
+			if testcase.storageType == storageConstants.AzureStorageDriverName {
+				cleanupRoot = "/"
+			}
+			defer cleanupStorage(store, cleanupRoot)
+
+			Convey("push late origin then early stub, rebuild without emptying origin", t, func() {
+				ctx := context.Background()
+				content := []byte("shared-layer-content-for-dedupe-origin-preserve")
+				digest := godigest.FromBytes(content)
+
+				// Late-sorting repo first so redis records it as the origin.
+				_, _, err := imgStore.FullBlobUpload(ctx, "b/img", bytes.NewReader(content), digest)
+				So(err, ShouldBeNil)
+
+				// Early-sorting repo second: stored as a 0-byte remote Link stub.
+				_, _, err = imgStore.FullBlobUpload(ctx, "a/img", bytes.NewReader(content), digest)
+				So(err, ShouldBeNil)
+
+				originPath := imgStore.BlobPath("b/img", digest)
+				stubPath := imgStore.BlobPath("a/img", digest)
+
+				originInfo, err := store.Stat(originPath)
+				So(err, ShouldBeNil)
+				So(originInfo.Size(), ShouldBeGreaterThan, 0)
+
+				stubInfo, err := store.Stat(stubPath)
+				So(err, ShouldBeNil)
+				So(stubInfo.Size(), ShouldEqual, 0)
+
+				// Restart-style: new ImageStore, same remote objects + same redis cache.
+				_, imgStore2, _, err := createObjectsStore(opts)
+				So(err, ShouldBeNil)
+
+				err = imgStore2.RunDedupeForDigest(ctx, digest, true, []string{stubPath, originPath})
+				So(err, ShouldBeNil)
+
+				originInfo, err = store.Stat(originPath)
+				So(err, ShouldBeNil)
+				So(originInfo.Size(), ShouldEqual, int64(len(content)))
+
+				got, err := imgStore2.GetBlobContent("b/img", digest)
+				So(err, ShouldBeNil)
+				So(got, ShouldResemble, content)
+
+				got, err = imgStore2.GetBlobContent("a/img", digest)
+				So(err, ShouldBeNil)
+				So(got, ShouldResemble, content)
+			})
+		})
+	}
 }

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	guuid "github.com/gofrs/uuid"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-github/v62/github"
 	"github.com/gorilla/mux"
@@ -60,6 +61,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/cli/server"
 	"zotregistry.dev/zot/v2/pkg/common"
 	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
+	syncConstants "zotregistry.dev/zot/v2/pkg/extensions/sync/constants"
 	"zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/meta"
 	zreg "zotregistry.dev/zot/v2/pkg/regexp"
@@ -678,17 +680,22 @@ func TestObjectStorageController(t *testing.T) {
 		conf.Storage.RemoteCache = true
 		conf.Storage.StorageDriver = storageDriverParams
 
+		// Unique DynamoDB table names: shared fixed names race with other packages under
+		// `go test ./...` (notably pkg/meta TestParseStorageDynamoWrapper ResetTable).
+		tableSuffix, err := guuid.NewV4()
+		So(err, ShouldBeNil)
+
 		conf.Storage.CacheDriver = map[string]any{
 			"name":                   "dynamodb",
 			"endpoint":               os.Getenv("DYNAMODBMOCK_ENDPOINT"),
 			"region":                 "us-east-2",
-			"cachetablename":         "test",
-			"repometatablename":      "RepoMetadataTable",
-			"imagemetatablename":     "ZotImageMetaTable",
-			"repoblobsinfotablename": "ZotRepoBlobsInfoTable",
-			"userdatatablename":      "ZotUserDataTable",
-			"apikeytablename":        "APIKeyTable1",
-			"versiontablename":       "Version",
+			"cachetablename":         "test" + tableSuffix.String(),
+			"repometatablename":      "RepoMetadataTable" + tableSuffix.String(),
+			"imagemetatablename":     "ZotImageMetaTable" + tableSuffix.String(),
+			"repoblobsinfotablename": "ZotRepoBlobsInfoTable" + tableSuffix.String(),
+			"userdatatablename":      "ZotUserDataTable" + tableSuffix.String(),
+			"apikeytablename":        "APIKeyTable1" + tableSuffix.String(),
+			"versiontablename":       "Version" + tableSuffix.String(),
 		}
 
 		mockOIDCServer, err := authutils.MockOIDCRun()
@@ -2087,6 +2094,24 @@ func TestMultipleInstance(t *testing.T) {
 
 		err = ctlr.Init()
 		So(err, ShouldNotBeNil)
+	})
+}
+
+func TestInitRemovesStreamTempFiles(t *testing.T) {
+	Convey("Init removes stream temp files left by a previous run", t, func() {
+		conf := config.New()
+		rootDir := t.TempDir()
+		conf.Storage.RootDirectory = rootDir
+
+		orphan := filepath.Join(rootDir, syncConstants.StreamTempDir, "sha256", "0123abcd.1")
+		So(os.MkdirAll(filepath.Dir(orphan), 0o755), ShouldBeNil)
+		So(os.WriteFile(orphan, []byte("partial blob"), 0o600), ShouldBeNil)
+
+		ctlr := api.NewController(conf)
+		So(ctlr.Init(), ShouldBeNil)
+
+		_, err := os.Stat(filepath.Join(rootDir, syncConstants.StreamTempDir))
+		So(os.IsNotExist(err), ShouldBeTrue)
 	})
 }
 
@@ -7344,6 +7369,63 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 	})
 }
 
+func TestDisableAnonymousCatalog(t *testing.T) {
+	Convey("Catalog listing for anonymous users can be disabled", t, func() {
+		const (
+			TestRepo = "my-repos/repo"
+			user     = "alice"
+			password = "alicepass"
+		)
+
+		conf := config.New()
+		conf.Storage.GC = false
+		conf.HTTP.Port = "0"
+		conf.HTTP.Auth = &config.AuthConfig{
+			HTPasswd: config.AuthHTPasswd{
+				Path: test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(user, password)),
+			},
+		}
+		conf.HTTP.AccessControl = &config.AccessControlConfig{
+			Repositories: config.Repositories{
+				TestRepo: config.PolicyGroup{
+					AnonymousPolicy: []string{"read"},
+					Policies: []config.Policy{
+						{Users: []string{user}, Actions: []string{"read"}},
+					},
+				},
+			},
+		}
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		// default: anonymous listing is allowed
+		resp, err := resty.R().Get(baseURL + "/v2/_catalog")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		// disable it (read live from config, as on hot reload)
+		conf.HTTP.AccessControl.DisableAnonymousCatalog = true
+
+		resp, err = resty.R().Get(baseURL + "/v2/_catalog")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+
+		// authenticated users can still list
+		resp, err = resty.R().SetBasicAuth(user, password).Get(baseURL + "/v2/_catalog")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		// other anonymous reads are unaffected
+		resp, err = resty.R().Get(baseURL + "/v2/")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+	})
+}
+
 // anonymous-only (no CookieStore) + UI X-ZOT-API-CLIENT must not panic on search.
 func TestAnonymousOnlyWithUIClientHeader(t *testing.T) {
 	Convey("anonymous-only access with UI client header does not panic", t, func() {
@@ -7846,6 +7928,101 @@ func TestInvalidCases(t *testing.T) {
 			Post(fmt.Sprintf("%s/v2/%s/blobs/uploads/", baseURL, name))
 		So(err, ShouldBeNil)
 		So(postResponse.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+	})
+}
+
+// TestHTTPStorageFSPermissionDenied checks that real local EACCES (chmod) on an
+// existing repo maps to Permanent HTTP 500 via writeStorageClassError, not a
+// client-facing 404 (NAME_UNKNOWN / MANIFEST_UNKNOWN / BLOB_UNKNOWN).
+func TestHTTPStorageFSPermissionDenied(t *testing.T) {
+	// Root can still read/write mode 000 paths; same guard as local driver tests.
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 000 does not deny root")
+	}
+
+	Convey("local FS permission denials map to Permanent 500, not client 404", t, func() {
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.Storage.GC = false
+
+		dir := t.TempDir()
+		ctlr := makeController(conf, dir)
+
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+		defer cm.StopServer()
+
+		repo := "fs-perm-denied"
+		tag := "1.0"
+		img := CreateRandomImage()
+		So(UploadImage(img, baseURL, repo, tag), ShouldBeNil)
+
+		repoDir := path.Join(dir, repo)
+		indexPath := path.Join(repoDir, ispec.ImageIndexFile)
+		uploadsDir := path.Join(repoDir, storageConstants.BlobUploadDir)
+		layerDigest := img.Manifest.Layers[0].Digest
+		blobPath := path.Join(repoDir, ispec.ImageBlobsDir, layerDigest.Algorithm().String(), layerDigest.Encoded())
+
+		Convey("unreadable index.json: GET manifest is 500 not not-found", func() {
+			So(os.Chmod(indexPath, 0o000), ShouldBeNil)
+			defer func() { _ = os.Chmod(indexPath, 0o644) }()
+
+			resp, err := resty.R().Get(baseURL + "/v2/" + repo + "/manifests/" + tag)
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "NAME_UNKNOWN")
+			So(resp.String(), ShouldNotContainSubstring, "MANIFEST_UNKNOWN")
+			So(resp.String(), ShouldNotContainSubstring, "MANIFEST_INVALID")
+		})
+
+		Convey("unreadable index.json: ListTags is 500 not NAME_UNKNOWN", func() {
+			So(os.Chmod(indexPath, 0o000), ShouldBeNil)
+			defer func() { _ = os.Chmod(indexPath, 0o644) }()
+
+			resp, err := resty.R().Get(baseURL + "/v2/" + repo + "/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "NAME_UNKNOWN")
+		})
+
+		Convey("unreadable blob dir: CheckBlob/GetBlob is 500 not BLOB_UNKNOWN", func() {
+			// Stat does not need read bits on the blob file itself; deny traverse
+			// on the algorithm directory so Stat/open both see EACCES.
+			blobAlgDir := path.Dir(blobPath)
+			So(os.Chmod(blobAlgDir, 0o000), ShouldBeNil)
+			defer func() { _ = os.Chmod(blobAlgDir, 0o755) }()
+
+			resp, err := resty.R().Head(baseURL + "/v2/" + repo + "/blobs/" + layerDigest.String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "BLOB_UNKNOWN")
+
+			resp, err = resty.R().Get(baseURL + "/v2/" + repo + "/blobs/" + layerDigest.String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "BLOB_UNKNOWN")
+		})
+
+		Convey("unreadable blob file: GetBlob is 500 not BLOB_UNKNOWN", func() {
+			// Open requires read; chmod 000 on the file alone is enough for GET.
+			So(os.Chmod(blobPath, 0o000), ShouldBeNil)
+			defer func() { _ = os.Chmod(blobPath, 0o644) }()
+
+			resp, err := resty.R().Get(baseURL + "/v2/" + repo + "/blobs/" + layerDigest.String())
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "BLOB_UNKNOWN")
+		})
+
+		Convey("unwritable .uploads: CreateBlobUpload is 500 not NAME_UNKNOWN", func() {
+			So(os.Chmod(uploadsDir, 0o000), ShouldBeNil)
+			defer func() { _ = os.Chmod(uploadsDir, 0o755) }()
+
+			resp, err := resty.R().Post(baseURL + "/v2/" + repo + "/blobs/uploads/")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusInternalServerError)
+			So(resp.String(), ShouldNotContainSubstring, "NAME_UNKNOWN")
+		})
 	})
 }
 
@@ -9152,6 +9329,53 @@ func TestDeleteManifestMissingRepo(t *testing.T) {
 		So(json.Unmarshal(resp.Body(), &errList), ShouldBeNil)
 		So(errList.Errors, ShouldNotBeEmpty)
 		So(errList.Errors[0].Code, ShouldEqual, "NAME_UNKNOWN")
+	})
+}
+
+func TestPutManifestMissingBlob(t *testing.T) {
+	Convey("Pushing a manifest that references a missing blob returns MANIFEST_BLOB_UNKNOWN", t, func() {
+		conf := config.New()
+		conf.HTTP.Port = "0"
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		img := CreateRandomImage()
+		So(UploadImage(img, baseURL, "missing-blob", "1.0"), ShouldBeNil)
+
+		missing := godigest.FromString("never uploaded")
+
+		putManifest := func(manifest ispec.Manifest) {
+			body, err := json.Marshal(manifest)
+			So(err, ShouldBeNil)
+
+			resp, err := resty.R().SetHeader("Content-Type", ispec.MediaTypeImageManifest).
+				SetBody(body).Put(baseURL + "/v2/missing-blob/manifests/2.0")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusBadRequest)
+
+			var errList apiErr.ErrorList
+			So(json.Unmarshal(resp.Body(), &errList), ShouldBeNil)
+			So(errList.Errors, ShouldHaveLength, 1)
+			So(errList.Errors[0].Code, ShouldEqual, "MANIFEST_BLOB_UNKNOWN")
+			So(errList.Errors[0].Detail["digest"], ShouldEqual, missing.String())
+		}
+
+		Convey("missing layer", func() {
+			manifest := img.Manifest
+			manifest.Layers = append([]ispec.Descriptor(nil), manifest.Layers...)
+			manifest.Layers[0].Digest = missing
+			putManifest(manifest)
+		})
+
+		Convey("missing config", func() {
+			manifest := img.Manifest
+			manifest.Config.Digest = missing
+			putManifest(manifest)
+		})
 	})
 }
 
@@ -13169,7 +13393,7 @@ func TestInjectTooManyOpenFiles(t *testing.T) {
 			defer resp.Body.Close()
 
 			if injected {
-				So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+				So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
 			} else {
 				So(resp.StatusCode, ShouldEqual, http.StatusCreated)
 			}
@@ -13191,7 +13415,7 @@ func TestInjectTooManyOpenFiles(t *testing.T) {
 			So(resp, ShouldNotBeNil)
 
 			if injected {
-				So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+				So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
 			} else {
 				So(resp.StatusCode, ShouldEqual, http.StatusCreated)
 			}
@@ -13213,7 +13437,7 @@ func TestInjectTooManyOpenFiles(t *testing.T) {
 			So(resp, ShouldNotBeNil)
 
 			if injected {
-				So(resp.StatusCode, ShouldEqual, http.StatusInternalServerError)
+				So(resp.StatusCode, ShouldEqual, http.StatusServiceUnavailable)
 			} else {
 				So(resp.StatusCode, ShouldEqual, http.StatusCreated)
 			}

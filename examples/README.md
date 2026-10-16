@@ -1031,6 +1031,23 @@ When authentication is configured and repositories have non-anonymous policies, 
 
 See [config-metrics-authn-anonymous-access.json](config-metrics-authn-anonymous-access.json) for a complete example.
 
+##### Disabling anonymous catalog listing
+
+By default, an `anonymousPolicy` with `read` also lets unauthenticated users list repositories through `GET /v2/_catalog` (filtered to the repositories they can read). Set `disableAnonymousCatalog` to `true` in `accessControl` to reject anonymous catalog requests with `401 Unauthorized`:
+
+```
+"accessControl": {
+    "disableAnonymousCatalog": true,
+    "repositories": {
+        "**": { "anonymousPolicy": ["read"] }
+    }
+}
+```
+
+Anonymous pulls from repositories allowed by `anonymousPolicy` keep working, and authenticated users can still list the catalog. The option can be changed with a config hot reload (SIGHUP). It only affects `/v2/_catalog`; it does not restrict the search extension's GraphQL repository listings.
+
+See [config-anonymous-catalog-disabled.json](config-anonymous-catalog-disabled.json) for a complete example.
+
 ##### Conditional access on policies
 
 Policy entries can carry an optional list of `conditions`: CEL boolean
@@ -1428,6 +1445,8 @@ Configure each registry sync:
 				"urls": ["https://registry1:5000"],
 				"onDemand": false,                  # pull any image which the local registry doesn't have
 				"onDemandInBackground": false,      # return immediately when the manifest is missing locally and sync it into storage in the background; requires onDemand; incompatible with manifestCheckInterval
+				"stream": false,                    # serve an on-demand image to the client while it downloads instead of after it is synced; requires onDemand and https urls with tlsVerify; incompatible with onDemandInBackground and maxRetries/retryDelay. See "Streaming on-demand sync" below
+				"maxConcurrentStreams": 32,         # with stream: cap on distinct blobs streaming at once, shared by all streaming registries (all must agree); past it, requests use blocking on-demand sync (default: 32)
 				"pollInterval": "6h",               # polling interval, if not set then periodically polling will not run
 				"platforms": ["linux/amd64"],       # periodic sync default: sparse-copy these OS/arch[/variant] children; omit/empty = all. Overridden by content[].platforms when set. On-demand ignores both. Extra slash tokens beyond three are ignored by platform.Parse (not rejected).
 				"manifestCheckInterval": "1h",      # minimum interval between upstream manifest checks for the same repo:tag when serving on-demand requests; when 0 or unset every request checks upstream. Requires onDemand.
@@ -1551,6 +1570,38 @@ Notes:
  - when multiple sync registries are configured, background sync applies per repo: only registries with
    `onDemandInBackground` whose content rules match the local repo are used for the background sync;
    other registries keep normal blocking on-demand for their repos
+
+### Streaming on-demand sync
+
+With `"stream": true`, a client pulling an image that is not yet local gets the upstream manifest
+right away and its blobs as they arrive from upstream, instead of waiting for the whole image to be
+synced. The sync into storage runs in the background. See `examples/config-sync-streaming.json`:
+
+```
+			"registries": [{
+				"urls": ["https://registry-1.docker.io"],
+				"onDemand": true,
+				"stream": true,
+				"maxConcurrentStreams": 32
+			}]
+```
+
+Notes:
+
+ - requires `onDemand` and `https://` URLs with `tlsVerify` (the default): bytes reach the client before
+   the blob's digest is verified, so the upstream must be authenticated
+ - incompatible with `onDemandInBackground`, `maxRetries`/`retryDelay` and `"tlsVerify": false`
+ - `maxConcurrentStreams` (default 32, must be > 0) is a single cap shared by every streaming registry, so
+   all of them must set the same value; past it, requests fall back to blocking on-demand sync
+ - `preserveDigest` is not needed: it is deprecated and ignored, and a streamed manifest is never converted
+ - each blob being streamed is staged on local disk once, as for plain on-demand sync: its stream temp file
+   is hard-linked into the sync session. It lives under the storage root dir or, for S3/Azure/GCS, under
+   `extensions.sync.downloadDir`, which must then be set
+ - a streamed blob is sent within one response, so `http.writeTimeout` (default `60s`, an absolute deadline
+   for writing the whole response) must cover the slowest blob pull expected, or the client is cut off
+   mid-blob; the example sets `30m`. It applies to every response, so a higher value also lets a slow or
+   stalled client hold its connection longer
+ - design and on-disk layout: `pkg/extensions/sync/README_streaming_sync.md`
 
 ### Sync's certDir option
 

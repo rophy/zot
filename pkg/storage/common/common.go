@@ -16,7 +16,6 @@ import (
 
 	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
 	docker "github.com/distribution/distribution/v3/manifest/schema2"
-	"github.com/distribution/distribution/v3/registry/storage/driver"
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/schema"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -29,13 +28,11 @@ import (
 	zlog "zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/scheduler"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
-const (
-	manifestWithEmptyLayersErrMsg = "layers/minItems: minimum 1 items required, but found 0 items"
-	cosignSignatureTagSuffix      = "sig"
-)
+const manifestWithEmptyLayersErrMsg = "layers/minItems: minimum 1 items required, but found 0 items"
 
 func GetTagsByIndex(index ispec.Index) []string {
 	tags := make([]string, 0)
@@ -106,11 +103,25 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 			manifest.Config.MediaType == ispec.MediaTypeEmptyJSON {
 			// validate config blob - a lightweight check if the blob is present
 			ok, _, _, err := imgStore.StatBlob(repo, manifest.Config.Digest)
-			if !ok || err != nil {
+			if err != nil {
+				if !errclass.IsBlobUnavailable(err) {
+					log.Error().Err(err).Str("digest", manifest.Config.Digest.String()).
+						Msg("failed to stat config blob")
+
+					return err
+				}
+
 				log.Error().Err(err).Str("digest", manifest.Config.Digest.String()).
 					Msg("failed to stat blob due to missing config blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(manifest.Config.Digest)
+			}
+
+			if !ok {
+				log.Error().Str("digest", manifest.Config.Digest.String()).
+					Msg("failed to stat blob due to missing config blob")
+
+				return missingBlobError(manifest.Config.Digest)
 			}
 
 			// validate layers - a lightweight check if the blob is present
@@ -123,11 +134,25 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 				}
 
 				ok, _, _, err := imgStore.StatBlob(repo, layer.Digest)
-				if !ok || err != nil {
+				if err != nil {
+					if !errclass.IsBlobUnavailable(err) {
+						log.Error().Err(err).Str("digest", layer.Digest.String()).
+							Msg("failed to stat layer blob")
+
+						return err
+					}
+
 					log.Error().Err(err).Str("digest", layer.Digest.String()).
 						Msg("failed to validate manifest due to missing layer blob")
 
-					return zerr.ErrBadManifest
+					return missingBlobError(layer.Digest)
+				}
+
+				if !ok {
+					log.Error().Str("digest", layer.Digest.String()).
+						Msg("failed to validate manifest due to missing layer blob")
+
+					return missingBlobError(layer.Digest)
 				}
 			}
 		}
@@ -163,11 +188,25 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 			}
 
 			ok, _, _, err := imgStore.StatBlob(repo, desc.Digest)
-			if !ok || err != nil {
+			if err != nil {
+				if !errclass.IsBlobUnavailable(err) {
+					log.Error().Err(err).Str("digest", desc.Digest.String()).
+						Msg("failed to stat non-OCI descriptor blob")
+
+					return err
+				}
+
 				log.Error().Err(err).Str("digest", desc.Digest.String()).
 					Msg("failed to stat non-OCI descriptor due to missing blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(desc.Digest)
+			}
+
+			if !ok {
+				log.Error().Str("digest", desc.Digest.String()).
+					Msg("failed to stat non-OCI descriptor due to missing blob")
+
+				return missingBlobError(desc.Digest)
 			}
 		}
 	case dockerList.MediaTypeManifestList:
@@ -182,6 +221,11 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 	}
 
 	return nil
+}
+
+func missingBlobError(digest godigest.Digest) error {
+	return zerr.NewError(fmt.Errorf("%w: %w", zerr.ErrBadManifest, zerr.ErrBlobNotFound)).
+		AddDetail("digest", digest.String())
 }
 
 // GetAndValidateRequestDigest returns the canonical digest or the digest provided by the reference if any.
@@ -289,7 +333,7 @@ func GetIndex(imgStore storageTypes.ImageStore, repo string, log zlog.Logger) (i
 
 	buf, err := imgStore.GetIndexContent(repo)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			return index, zerr.ErrRepoNotFound
 		}
 
@@ -471,8 +515,7 @@ func PruneImageManifestsFromIndex(imgStore storageTypes.ImageStore, repo string,
 		oindex, err := GetImageIndex(imgStore, repo, otherIndex.Digest, log)
 		if err != nil {
 			// Handle missing blobs gracefully - log warning and continue with other indexes
-			var pathNotFoundErr driver.PathNotFoundError
-			if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+			if errclass.IsBlobUnavailable(err) {
 				log.Warn().Err(err).Str("repository", repo).Str("digest", otherIndex.Digest.String()).
 					Msg("skipping missing image index blob, continuing with other indexes")
 
@@ -536,8 +579,7 @@ func isBlobReferencedInImageManifest(imgStore storageTypes.ImageStore, repo stri
 	manifestContent, err := GetImageManifest(imgStore, repo, mdigest, log)
 	if err != nil {
 		// Handle missing blobs gracefully - treat as not referenced and continue
-		var pathNotFoundErr driver.PathNotFoundError
-		if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+		if errclass.IsBlobUnavailable(err) {
 			log.Warn().Err(err).Str("repo", repo).Str("digest", mdigest.String()).Str("component", "gc").
 				Msg("skipping missing manifest blob, treating as not referenced")
 
@@ -598,8 +640,7 @@ func isBlobReferencedInImageIndex(imgStore storageTypes.ImageStore, repo string,
 			indexImage, err := GetImageIndex(imgStore, repo, desc.Digest, log)
 			if err != nil {
 				// Handle missing blobs gracefully - treat as not referenced and continue
-				var pathNotFoundErr driver.PathNotFoundError
-				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				if errclass.IsBlobUnavailable(err) {
 					log.Warn().Err(err).Str("repository", repo).Str("digest", desc.Digest.String()).
 						Msg("skipping missing image index blob, treating as not referenced")
 
@@ -643,11 +684,9 @@ func isBlobReferencedInImageIndex(imgStore storageTypes.ImageStore, repo string,
 func IsBlobReferenced(imgStore storageTypes.ImageStore, repo string,
 	digest godigest.Digest, log zlog.Logger,
 ) (bool, error) {
-	dir := path.Join(imgStore.RootDir(), repo)
-	if !imgStore.DirExists(dir) {
-		return false, zerr.ErrRepoNotFound
-	}
-
+	// Do not use DirExists: it is bool-only and collapses Transient Stat to
+	// ErrRepoNotFound. GetIndex maps Missing → ErrRepoNotFound and preserves
+	// Transient/Permanent.
 	index, err := GetIndex(imgStore, repo, log)
 	if err != nil {
 		return false, err
@@ -662,16 +701,14 @@ manifest digests themselves plus the config and layer digests of every (possibly
 
 It mirrors the traversal of IsBlobReferencedInImageIndex, but reads each manifest only once,
 so callers checking many digests (e.g. GC) avoid re-reading every manifest per digest.
-Missing manifests (ErrBlobNotFound / PathNotFound) are skipped; any other read/unmarshal error
+Missing manifests (errclass.IsBlobUnavailable) are skipped; any other read/unmarshal error
 is returned to the caller.
 */
 func GetReferencedBlobs(imgStore storageTypes.ImageStore, repo string, log zlog.Logger,
 ) (map[godigest.Digest]struct{}, error) {
-	dir := path.Join(imgStore.RootDir(), repo)
-	if !imgStore.DirExists(dir) {
-		return nil, zerr.ErrRepoNotFound
-	}
-
+	// Do not use DirExists: it is bool-only and collapses Transient Stat to
+	// ErrRepoNotFound. GetIndex maps Missing → ErrRepoNotFound and preserves
+	// Transient/Permanent.
 	index, err := GetIndex(imgStore, repo, log)
 	if err != nil {
 		return nil, err
@@ -703,8 +740,7 @@ func collectReferencedBlobs(imgStore storageTypes.ImageStore, repo string,
 		case compat.IsImageIndexMediaType(desc.MediaType):
 			indexImage, err := GetImageIndex(imgStore, repo, desc.Digest, log)
 			if err != nil {
-				var pathNotFoundErr driver.PathNotFoundError
-				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				if errclass.IsBlobUnavailable(err) {
 					log.Warn().Err(err).Str("repository", repo).Str("digest", desc.Digest.String()).
 						Msg("skipping missing image index blob while collecting referenced blobs")
 
@@ -723,8 +759,7 @@ func collectReferencedBlobs(imgStore storageTypes.ImageStore, repo string,
 		case compat.IsImageManifestMediaType(desc.MediaType):
 			manifestContent, err := GetImageManifest(imgStore, repo, desc.Digest, log)
 			if err != nil {
-				var pathNotFoundErr driver.PathNotFoundError
-				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				if errclass.IsBlobUnavailable(err) {
 					log.Warn().Err(err).Str("repository", repo).Str("digest", desc.Digest.String()).
 						Msg("skipping missing manifest blob while collecting referenced blobs")
 
@@ -784,8 +819,8 @@ func IsSignature(descriptor ispec.Descriptor) bool {
 
 	switch descriptor.MediaType {
 	case ispec.MediaTypeImageManifest:
-		// is cosgin signature
-		if strings.HasPrefix(tag, "sha256-") && strings.HasSuffix(tag, cosignSignatureTagSuffix) {
+		// is legacy cosign signature tag; malformed lookalikes such as "sha256-abc.sig" are linted as images
+		if zcommon.IsCosignSignature(tag) {
 			return true
 		}
 
@@ -814,11 +849,9 @@ func GetReferrers(imgStore storageTypes.ImageStore, repo string, gdigest godiges
 		return nilIndex, err
 	}
 
-	dir := path.Join(imgStore.RootDir(), repo)
-	if !imgStore.DirExists(dir) {
-		return newEmptyReferrersIndex(), nil
-	}
-
+	// Do not use DirExists: it is bool-only and collapses Transient Stat into
+	// empty 200. GetIndex maps Missing → ErrRepoNotFound (empty referrers) and
+	// preserves Transient/Permanent for callers (HTTP → 503/500).
 	index, err := GetIndex(imgStore, repo, log)
 	if err != nil {
 		if errors.Is(err, zerr.ErrRepoNotFound) {
@@ -846,8 +879,7 @@ func GetReferrers(imgStore storageTypes.ImageStore, repo string, gdigest godiges
 
 		buf, err := imgStore.GetBlobContent(repo, descriptor.Digest)
 		if err != nil {
-			var pathNotFoundErr driver.PathNotFoundError
-			if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+			if errclass.IsBlobUnavailable(err) {
 				log.Warn().Err(err).Str("blob", imgStore.BlobPath(repo, descriptor.Digest)).
 					Msg("skipping missing blob while listing referrers")
 
@@ -971,17 +1003,24 @@ func getBlobDescriptorFromIndex(imgStore storageTypes.ImageStore, index ispec.In
 		case compat.IsImageManifestMediaType(desc.MediaType):
 			seen[desc.Digest] = struct{}{}
 
-			if foundDescriptor, err := getBlobDescriptorFromManifest(imgStore, repo, blobDigest, desc, log); err == nil {
+			foundDescriptor, err := getBlobDescriptorFromManifest(imgStore, repo, blobDigest, desc, log)
+			if err == nil {
 				return foundDescriptor, nil
 			}
+
+			// Soft-skip only absence; Transient/Permanent must not collapse to ErrBlobNotFound.
+			if errclass.IsBlobUnavailable(err) {
+				continue
+			}
+
+			return ispec.Descriptor{}, err
 		case compat.IsImageIndexMediaType(desc.MediaType):
 			seen[desc.Digest] = struct{}{}
 
 			indexImage, err := GetImageIndex(imgStore, repo, desc.Digest, log)
 			if err != nil {
 				// Handle missing blobs gracefully - skip this index and continue searching
-				var pathNotFoundErr driver.PathNotFoundError
-				if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				if errclass.IsBlobUnavailable(err) {
 					log.Warn().Err(err).Str("repository", repo).Str("digest", desc.Digest.String()).
 						Msg("skipping missing image index blob, continuing search for blob descriptor")
 
@@ -995,6 +1034,12 @@ func getBlobDescriptorFromIndex(imgStore storageTypes.ImageStore, index ispec.In
 			if err == nil {
 				return foundDescriptor, nil
 			}
+
+			if errclass.IsBlobUnavailable(err) {
+				continue
+			}
+
+			return ispec.Descriptor{}, err
 		}
 	}
 

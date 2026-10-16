@@ -71,6 +71,37 @@ func NewAccessController(conf *config.Config) *AccessController {
 	}
 }
 
+// repositoriesForUser resolves username placeholders for both request authorization
+// and repository visibility. Static rules override templates resolving to the same
+// pattern, so operators can reserve namespaces using explicit rules.
+func (ac *AccessController) repositoriesForUser(username string) config.Repositories {
+	const placeholder = "${username}"
+
+	repositories := make(config.Repositories, len(ac.Config.Repositories))
+	validUsername := !strings.Contains(username, "/") && zreg.FullNameRegexp.MatchString(username)
+
+	for pattern, policyGroup := range ac.Config.Repositories {
+		if !strings.Contains(pattern, placeholder) {
+			repositories[pattern] = policyGroup
+
+			continue
+		}
+
+		// Anonymous users and names that are not literal repository components
+		// must never expand into a namespace or introduce glob operators.
+		if !validUsername {
+			continue
+		}
+
+		resolved := strings.ReplaceAll(pattern, placeholder, username)
+		if _, static := ac.Config.Repositories[resolved]; !static {
+			repositories[resolved] = policyGroup
+		}
+	}
+
+	return repositories
+}
+
 // getGlobPatterns gets glob patterns from authz config on which <username> has <action> perms.
 // used to filter /v2/_catalog repositories based on user rights.
 func (ac *AccessController) getGlobPatterns(evalReq *evalRequest) map[string]bool {
@@ -80,7 +111,7 @@ func (ac *AccessController) getGlobPatterns(evalReq *evalRequest) map[string]boo
 	groups := evalReq.groups()
 	action := evalReq.action
 
-	for pattern, policyGroup := range ac.Config.Repositories {
+	for pattern, policyGroup := range ac.repositoriesForUser(username) {
 		if username == "" {
 			// check anonymous policy
 			if slices.Contains(policyGroup.AnonymousPolicy, action) {
@@ -139,7 +170,9 @@ func (ac *AccessController) can(httpReq *http.Request, userAc *reqCtx.UserAccess
 ) (bool, string) {
 	var longestMatchedPattern string
 
-	for pattern := range ac.Config.Repositories {
+	repositories := ac.repositoriesForUser(userAc.GetUsername())
+
+	for pattern := range repositories {
 		matched, err := glob.Match(pattern, repository)
 		if err == nil {
 			if matched && len(pattern) > len(longestMatchedPattern) {
@@ -165,7 +198,6 @@ func (ac *AccessController) can(httpReq *http.Request, userAc *reqCtx.UserAccess
 		reason string
 	)
 
-	repositories := ac.Config.GetRepositories()
 	if pg, ok := repositories[longestMatchedPattern]; ok {
 		can, reason = ac.isPermitted(evalReq, pg)
 	}
@@ -264,6 +296,22 @@ func (ac *AccessController) attachPermissionEvaluator(httpReq *http.Request, use
 	})
 }
 
+// attachAdminPolicyEvaluator wires the adminPolicy check, including its conditions, into userAc for
+// admin-only routes. Those routes have no repository or reference, so conditions see them empty.
+func (ac *AccessController) attachAdminPolicyEvaluator(httpReq *http.Request, userAc *reqCtx.UserAccessControl) {
+	userAc.SetAdminPolicyEvaluator(func() (bool, string) {
+		if !ac.isAdmin(userAc.GetUsername(), userAc.GetGroups()) {
+			return false, ""
+		}
+
+		return ac.policyConditionsMet(ac.Config.GetAdminPolicy(), &evalRequest{
+			httpReq: httpReq,
+			userAc:  userAc,
+			isAdmin: true,
+		})
+	})
+}
+
 // getAuthnMiddlewareContext builds ac context(allowed to read repos and if user is admin) and returns it.
 func (ac *AccessController) getAuthnMiddlewareContext(authnType string, request *http.Request) context.Context {
 	amwCtx := reqCtx.AuthnMiddlewareContext{
@@ -316,8 +364,15 @@ func CompileAccessControl(cfg *config.AccessControlConfig) (map[string]any, erro
 		return nil
 	}
 
-	for pattern, pg := range cfg.Repositories {
-		for i, policy := range pg.Policies {
+	for pattern, policyGroup := range cfg.Repositories {
+		for component := range strings.SplitSeq(pattern, "/") {
+			if strings.Contains(component, "${username}") && component != "${username}" {
+				return nil, fmt.Errorf("%w: repositories[%q]: ${username} must be a complete path component",
+					zerr.ErrBadConfig, pattern)
+			}
+		}
+
+		for i, policy := range policyGroup.Policies {
 			if err := compileAll(policy, fmt.Sprintf("repositories[%q].policies[%d]", pattern, i)); err != nil {
 				return nil, err
 			}
@@ -656,6 +711,7 @@ func BaseAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 
 			aCtlr.updateUserAccessControl(request, userAc)
 			aCtlr.attachPermissionEvaluator(request, userAc)
+			aCtlr.attachAdminPolicyEvaluator(request, userAc)
 			userAc.SaveOnRequest(request)
 
 			next.ServeHTTP(response, request) //nolint:contextcheck
@@ -717,6 +773,10 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 						// Fail closed if we cannot verify current tags for this repo.
 						ctlr.Log.Error().Err(repoTagErr).Str("repository", resource).
 							Msg("unable to verify permissions on existing tags")
+						if writeStorageClassError(response, repoTagErr) {
+							return
+						}
+
 						response.WriteHeader(http.StatusInternalServerError)
 
 						return
