@@ -19,7 +19,6 @@ import (
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/securecookie"
-	"github.com/zitadel/oidc/v3/pkg/client/rp"
 
 	"zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
@@ -42,22 +41,23 @@ const (
 )
 
 type Controller struct {
-	Config          *config.Config
-	Router          *mux.Router
-	MetaDB          mTypes.MetaDB
-	StoreController storage.StoreController
-	Log             log.Logger
-	Audit           *log.Logger
-	Server          *http.Server
-	Metrics         monitoring.MetricServer
-	EventRecorder   events.Recorder
+	Config            *config.Config
+	Router            *mux.Router
+	MetaDB            mTypes.MetaDB
+	StoreController   storage.StoreController
+	repoMutationLocks repoMutationLockSet
+	Log               log.Logger
+	Audit             *log.Logger
+	Server            *http.Server
+	Metrics           monitoring.MetricServer
+	EventRecorder     events.Recorder
 	// EventRecorder, typed so a reload can replace what it points at
 	eventReloader *events.ReloadableRecorder
 	// events config the installed recorder was built from
 	eventsFingerprint string
 	CveScanner        ext.CveScanner
 	SyncOnDemand      ext.SyncOnDemand
-	RelyingParties    map[string]rp.RelyingParty
+	RelyingParties    map[string]*LazyRelyingParty
 	CookieStore       *CookieStore
 	HTPasswd          *HTPasswd
 	HTPasswdWatcher   *HTPasswdWatcher

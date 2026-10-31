@@ -697,6 +697,36 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 			So(repoMeta.Tags, ShouldContainKey, "tag")
 		})
 
+		Convey("ProjectRepoSize applies tag-rooted digest deduplication without persisting", func() {
+			repo := "projected-repo"
+			first := CreateImageWith().RandomLayers(2, 10).RandomConfig().Build()
+			firstMeta := first.AsImageMeta()
+			firstSize := first.ManifestDescriptor.Size + first.ConfigDescriptor.Size + 2*10
+
+			current, projected, err := metaDB.GetRepoSizeWithCandidate(ctx, repo, []string{"latest"}, firstMeta)
+			So(err, ShouldBeNil)
+			So(current, ShouldEqual, 0)
+			So(projected, ShouldEqual, firstSize)
+
+			_, err = metaDB.GetRepoMeta(ctx, repo)
+			So(errors.Is(err, zerr.ErrRepoMetaNotFound), ShouldBeTrue)
+
+			So(metaDB.SetRepoReference(ctx, repo, "latest", firstMeta), ShouldBeNil)
+
+			second := CreateImageWith().LayerBlobs(first.Layers).RandomConfig().Build()
+			secondMeta := second.AsImageMeta()
+			secondProjected := firstSize + second.ManifestDescriptor.Size + second.ConfigDescriptor.Size
+
+			current, projected, err = metaDB.GetRepoSizeWithCandidate(ctx, repo, []string{"second"}, secondMeta)
+			So(err, ShouldBeNil)
+			So(current, ShouldEqual, firstSize)
+			So(projected, ShouldEqual, secondProjected)
+
+			repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+			So(err, ShouldBeNil)
+			So(repoMeta.Size, ShouldEqual, firstSize)
+		})
+
 		Convey("Test SetRepoReference", func() {
 			var (
 				repo1 = "repo1"
@@ -1097,6 +1127,26 @@ func RunMetaDBTests(t *testing.T, metaDB mTypes.MetaDB, preparationFuncs ...func
 				So(repoMeta.Size, ShouldEqual, image1Size)
 				So(repoMeta.Platforms, ShouldNotContain, ispec.Platform{OS: "os2", Architecture: "arch2"})
 				So(repoMeta.Vendors, ShouldNotContain, "vendor2")
+			})
+
+			Convey("Removing the last tag keeps statistics of the now untagged manifest", func() {
+				err = metaDB.RemoveRepoReference(repo, tag1, imageMeta1.Digest)
+				So(err, ShouldBeNil)
+
+				repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+				So(err, ShouldBeNil)
+
+				_, ok := repoMeta.Statistics[imageMeta1.Digest.String()]
+				So(ok, ShouldBeTrue)
+
+				err = metaDB.RemoveRepoReference(repo, imageMeta1.Digest.String(), imageMeta1.Digest)
+				So(err, ShouldBeNil)
+
+				repoMeta, err = metaDB.GetRepoMeta(ctx, repo)
+				So(err, ShouldBeNil)
+
+				_, ok = repoMeta.Statistics[imageMeta1.Digest.String()]
+				So(ok, ShouldBeFalse)
 			})
 
 			Convey("Delete inexistent reference from repo", func() {

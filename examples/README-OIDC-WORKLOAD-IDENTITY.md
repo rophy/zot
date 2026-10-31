@@ -69,6 +69,8 @@ Add OIDC workload identity configuration to your bearer authentication settings.
 
 - **`skipIssuerVerification`** (optional): Skip issuer verification (for testing only). Default: `false`.
 
+Tokens are routed to their configured issuer before verification; unknown issuers are rejected without network requests unless `skipIssuerVerification` is enabled. Discovery and signing-key HTTP requests, including on-demand requests for newly rotated keys, have a 10-second timeout. Once a verifier is one minute old, the next authentication starts a background refresh while the last working verifier remains available. If discovery or signing-key refresh fails, the last working verifier and its cached keys are retained, so already-known keys can validate tokens during an issuer outage. A token signed by a key that is not cached fetches the signing keys again, and every successful fetch replaces the cached keys, so keys the issuer has removed stop validating tokens. New signing keys still require a successful fetch from the issuer.
+
 ### CEL Expressions
 
 Zot uses [Common Expression Language (CEL)](https://github.com/google/cel-go) for flexible claim validation and mapping. CEL expressions have access to:
@@ -312,11 +314,11 @@ TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 echo "$TOKEN" | docker login -u zot --password-stdin zot.example.com
 ```
 
-This requires the registry challenge to advertise `realm: "https://zot.example.com/zot/auth/token"` and a `service` value matching the registry host clients use.
+This requires the registry challenge to advertise `realm: "https://zot.example.com/zot/auth/token"` and a `service` value matching the registry host clients use. The login username is not the registry identity. Zot splits the Basic credential on the first colon, so a username such as `token:test` makes the password `test:<jwt>`. The password Zot verifies must be a JWT whose issuer and audience match `bearer.oidc`. An opaque token is not verified. Zot rejects that request unless `upstreamTokenEndpoint` is set, in which case an unrecognized credential is forwarded.
 
 ### Kubernetes Image Pull Secrets
 
-For kubelet image pulls, store a projected ServiceAccount token as the password in a `kubernetes.io/dockerconfigjson` Secret. The username can be any non-empty value.
+For kubelet image pulls, store a projected ServiceAccount token as the password in a `kubernetes.io/dockerconfigjson` Secret. The username must not contain a colon. The password Zot verifies must be the OIDC JWT. An opaque access token is not verified. Without `upstreamTokenEndpoint`, that token request is rejected.
 
 ```yaml
 apiVersion: v1

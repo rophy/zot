@@ -189,13 +189,35 @@ To limit the maximum number of repositories that can be created, set:
 ```
 
 When the limit is reached, pushes that would create a new repository are
-rejected with HTTP 429. Pushes to existing repositories are always allowed.
+rejected with HTTP 413. Pushes to existing repositories are always allowed.
 Setting maxRepos to 0 or omitting it disables enforcement.
 
 A repository stops counting towards the limit when it is removed from
 storage: immediately when its last manifest is deleted and no blobs or
 uploads remain, or otherwise in a garbage collection cycle once its
 remaining blobs pass the GC delay.
+
+To limit the logical size of each repository, set `maxRepoBytes`:
+
+```
+        "maxRepoBytes": 10737418240
+```
+
+The value is measured in bytes and counts the unique manifest, index, config,
+and layer blobs reachable from the repository's tagged references. The same
+digest is counted only once within a repository. When a manifest push would
+increase the logical size beyond the limit, zot returns HTTP 413 with the
+current, projected, and configured sizes in the error detail. A value of 0 or
+omitting `maxRepoBytes` disables this enforcement. The setting can also be
+configured under a matching `subPaths` entry and takes effect after restart.
+Foreign and other non-distributable layers that are not stored locally use
+their descriptor sizes for logical quota accounting.
+
+This is a logical repository quota, not a physical disk quota. Shared physical
+blobs across repositories are not charged as a single-repository allocation.
+For deployments with multiple Zot instances sharing a metadata backend, use the
+existing single-writer cluster routing for repository writes; independent
+writers are not atomically coordinated by this quota implementation.
 
 It is also possible to store and serve images from multiple filesystems with
 their own repository paths, dedupe and garbage collection settings with:
@@ -456,6 +478,10 @@ zot supports several openID/OAuth2 providers:
  - gitlab
  - dex
 
+For OIDC providers (those configured with an `issuer`) zot accepts the ID token signing algorithms
+advertised in the issuer's discovery document (`id_token_signing_alg_values_supported`), for example RS256,
+ES256, PS256 or PS512.
+
 zot can be configured to use the above providers with:
 ```
 {
@@ -493,6 +519,11 @@ To login with either provider use http://127.0.0.1:8080/zot/auth/login?provider=
 for example to login with github use http://127.0.0.1:8080/zot/auth/login?provider=github&callback_ui=/home
 
 callback_ui query parameter is used by zot to redirect to UI after a successful openid/oauth2 authentication
+
+OpenID Connect providers are initialized lazily, on the first login attempt, so zot startup does not depend on
+the provider issuer being reachable. While the issuer is unreachable, the login and callback endpoints of that
+provider respond with `503 Service Unavailable` and initialization is retried on the next attempt; other
+authentication methods (htpasswd, LDAP, API keys) and registry operations keep working.
 
 By default, `callback_ui` must be a relative path (starting with `/`) to prevent open redirects.
 If your UI runs on a different origin (e.g. different port during development), you can allowlist
@@ -580,6 +611,22 @@ zot can be configured to use dex with:
 To login using openid dex provider use http://127.0.0.1:8080/zot/auth/login?provider=oidc
 
 `claimMapping.username` defaults to `email`, and `claimMapping.groups` defaults to `groups`.
+
+zot fetches the discovery document from `<issuer>/.well-known/openid-configuration`. If zot cannot reach the
+issuer's public URL, for example when the identity provider runs in the same cluster behind a gateway that
+blocks internal traffic, set `discoveryurl` to the full URL of the discovery document on an address zot can reach:
+
+```
+"oidc": {
+  "issuer": "https://auth.example.com/realms/zot",
+  "discoveryurl": "http://keycloak.auth.svc:8080/realms/zot/.well-known/openid-configuration",
+  ...
+}
+```
+
+The `issuer` in the fetched document must still equal the configured `issuer`. zot also calls the token, JWKS and
+userinfo endpoints listed in that document, so they must be reachable from zot as well. Keycloak, for example,
+lists internal URLs for these when `hostname-backchannel-dynamic` is enabled.
 
 NOTE: Social login is not supported by command line tools, or other software responsible for pushing/pulling
 images to/from zot.

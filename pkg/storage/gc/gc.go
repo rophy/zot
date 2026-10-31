@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	godigest "github.com/opencontainers/go-digest"
@@ -64,12 +65,18 @@ type GarbageCollect struct {
 	auditLog  *zlog.Logger
 	log       zlog.Logger
 	metrics   monitoring.MetricServer
+	// memos holds one WalkMemo per repository for the duration of its pass, so
+	// every read of a manifest or index during that pass hits storage once.
+	// Passes over one repository never overlap (the repository is locked), and
+	// the map is shared by the value-receiver copies of this struct.
+	memos *sync.Map
 }
 
 func NewGarbageCollect(imgStore types.ImageStore, metaDB mTypes.MetaDB, opts Options,
 	auditLog *zlog.Logger, log zlog.Logger, metrics monitoring.MetricServer,
 ) GarbageCollect {
 	return GarbageCollect{
+		memos:     &sync.Map{},
 		imgStore:  imgStore,
 		metaDB:    metaDB,
 		opts:      opts,
@@ -136,6 +143,22 @@ func (gc GarbageCollect) CleanRepo(ctx context.Context, repo string) error {
 	return nil
 }
 
+// memo returns the WalkMemo for a repository's in-progress pass, or nil (read-
+// through) when called outside one.
+func (gc GarbageCollect) memo(repo string) *common.WalkMemo {
+	if gc.memos == nil {
+		return nil
+	}
+
+	if v, ok := gc.memos.Load(repo); ok {
+		if memo, ok := v.(*common.WalkMemo); ok {
+			return memo
+		}
+	}
+
+	return nil
+}
+
 func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 	// removeUnreferencedBlobs deletes blobs one at a time, and with dedupe each delete may
 	// move or remove content other repositories link to; the store knows what that takes.
@@ -145,6 +168,15 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 }
 
 func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error {
+	// One memo for this pass: the referenced-set and orphan-blob walks each read
+	// every manifest and index in the repository, and did so from storage every
+	// time, one round-trip per entry. Storage is authoritative again once the
+	// pass ends. The cleanup lock is held by cleanRepo via WithRepoCleanupLock.
+	if gc.memos != nil {
+		gc.memos.Store(repo, common.NewWalkMemo())
+		defer gc.memos.Delete(repo)
+	}
+
 	/* this index (which represents the index.json of this repo) is the root point from which we
 	search for dangling manifests/blobs
 	so this index is passed by reference in all functions that modifies it
@@ -162,6 +194,15 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 		gc.log.Error().Err(err).Str("module", "gc").Str("repository", repo).Msg("failed to read index.json in repo")
 
 		return err
+	}
+
+	// One root Prefetch for the pass so referrer, untagged-identify, stale, and
+	// referenced-blob walks do not each pay serial GetIndex/GetManifest on
+	// index.json rows. Nested Prefetch stays at recursive walk sites for child
+	// descriptors that are not listed at the root.
+	gc.memo(repo).Prefetch(ctx, gc.imgStore, repo, index.Manifests, gc.log)
+	if zcommon.IsContextDone(ctx) {
+		return ctx.Err()
 	}
 
 	manifestsBefore := len(index.Manifests)
@@ -218,7 +259,7 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 		}
 
 		// delete unreferenced blobs from storage
-		blobsDeleted, err = gc.deleteUnreferencedBlobs(repo, gc.opts.Delay, gc.log)
+		blobsDeleted, err = gc.deleteUnreferencedBlobs(ctx, repo, gc.opts.Delay, gc.log)
 		if err != nil {
 			return err
 		}
@@ -285,6 +326,10 @@ func (gc GarbageCollect) removeUnknownMediaTypeManifestEntries(repo string, inde
 			return err
 		}
 	}
+
+	// A tag reference keeps statistics. Descriptors dropped here are gone, so any
+	// digest with no remaining row must be removed by digest or its statistics stay.
+	gc.clearStatisticsForPrunedDigests(repo, index.Manifests, kept)
 
 	if removed := len(index.Manifests) - len(kept); removed > 0 {
 		gc.log.Info().Str("module", "gc").Str("repository", repo).
@@ -363,6 +408,10 @@ func (gc GarbageCollect) removeStaleManifestEntries(repo string, index *ispec.In
 		kept = append(kept, desc)
 	}
 
+	// A tag reference keeps statistics. Descriptors dropped here are gone, so any
+	// digest with no remaining row must be removed by digest or its statistics stay.
+	gc.clearStatisticsForPrunedDigests(repo, index.Manifests, kept)
+
 	if removed := len(index.Manifests) - len(kept); removed > 0 {
 		gc.log.Info().Str("module", "gc").Str("repository", repo).
 			Int("removed", removed).Int("kept", len(kept)).
@@ -372,6 +421,64 @@ func (gc GarbageCollect) removeStaleManifestEntries(repo string, index *ispec.In
 	index.Manifests = kept
 
 	return nil
+}
+
+// clearStatisticsForPrunedDigests removes statistics for digests whose descriptors were
+// all dropped from the index. syncManifestRemoval passes a tag when the descriptor has
+// one, and a tag reference keeps statistics because ordinary tag deletion leaves an
+// untagged row. That row is not left here. A valid cosign tag is omitted: its metadata
+// is removed by DeleteSignature, not RemoveRepoReference. Untagged descriptors already
+// passed the digest.
+func (gc GarbageCollect) clearStatisticsForPrunedDigests(repo string, original, kept []ispec.Descriptor) {
+	if gc.metaDB == nil {
+		return
+	}
+
+	keptDigests := make(map[godigest.Digest]struct{}, len(kept))
+	for _, desc := range kept {
+		keptDigests[desc.Digest] = struct{}{}
+	}
+
+	seen := make(map[godigest.Digest]struct{})
+
+	for _, desc := range original {
+		if _, stillKept := keptDigests[desc.Digest]; stillKept {
+			continue
+		}
+
+		if _, done := seen[desc.Digest]; done {
+			continue
+		}
+
+		if !tagReferenceKeepsStatistics(desc) {
+			continue
+		}
+
+		seen[desc.Digest] = struct{}{}
+
+		if err := gc.metaDB.RemoveRepoReference(repo, desc.Digest.String(), desc.Digest); err != nil {
+			gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+				Str("repository", repo).Str("digest", desc.Digest.String()).
+				Msg("failed to drop statistics for a pruned manifest, continuing")
+		}
+	}
+}
+
+// tagReferenceKeepsStatistics reports whether syncManifestRemoval would remove this
+// descriptor by tag. RemoveRepoReference keeps statistics for a tag reference.
+func tagReferenceKeepsStatistics(desc ispec.Descriptor) bool {
+	tag, ok := getDescriptorTag(desc)
+	if !ok || tag == "" {
+		return false
+	}
+
+	if zcommon.IsCosignSignature(tag) {
+		if err := getSubjectFromCosignTag(tag).Validate(); err == nil {
+			return false
+		}
+	}
+
+	return true
 }
 
 // syncManifestRemoval best-effort syncs metaDB before a descriptor is removed from index.Manifests
@@ -475,7 +582,7 @@ func (gc GarbageCollect) confirmBlobMissing(repo string, digest godigest.Digest)
 func (gc GarbageCollect) imageIndexHasStaleNestedManifests(repo string, desc ispec.Descriptor,
 	existingBlobs map[string]bool,
 ) (bool, error) {
-	indexImage, err := common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+	indexImage, err := gc.memo(repo).GetIndex(gc.imgStore, repo, desc.Digest, gc.log)
 	if err != nil {
 		if errclass.IsBlobUnavailable(err) {
 			// GetBlobContent already proved the index blob is gone; no second Stat.
@@ -542,7 +649,7 @@ func (gc GarbageCollect) removeManifestsPerRepoPolicy(ctx context.Context, repo 
 
 			/* gather all manifests referenced in multiarch images/by other manifests
 			so that we can skip them in cleanUntaggedManifests */
-			if err := gc.identifyManifestsReferencedInIndex(*index, repo, referenced,
+			if err := gc.identifyManifestsReferencedInIndex(ctx, *index, repo, referenced,
 				map[godigest.Digest]struct{}{}); err != nil {
 				return err
 			}
@@ -618,7 +725,7 @@ func (gc GarbageCollect) removeReferrerByIndexDesc(repo string, rootIndex *ispec
 	if !cached {
 		var err error
 
-		indexImage, err = common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+		indexImage, err = gc.memo(repo).GetIndex(gc.imgStore, repo, desc.Digest, gc.log)
 		if err != nil {
 			if errclass.IsBlobUnavailable(err) {
 				missing[desc.Digest] = struct{}{}
@@ -658,7 +765,7 @@ func (gc GarbageCollect) removeReferrerByManifestDesc(repo string, rootIndex *is
 	if !cached {
 		var err error
 
-		image, err = common.GetImageManifest(gc.imgStore, repo, desc.Digest, gc.log)
+		image, err = gc.memo(repo).GetManifest(gc.imgStore, repo, desc.Digest, gc.log)
 		if err != nil {
 			if errclass.IsBlobUnavailable(err) {
 				missing[desc.Digest] = struct{}{}
@@ -844,7 +951,7 @@ func (gc GarbageCollect) removeManifestIfOlderThan(repo string, index *ispec.Ind
 
 	canGC, err := isBlobOlderThan(gc.imgStore, repo, desc.Digest, delay, gc.log)
 	if err != nil {
-		// Do not abort CleanRepo: age checks fail closed on any StatBlob error
+		// Do not abort CleanRepo: age checks fail closed on any StatBlobEntry error
 		// (Missing, Transient, or Permanent). Skip this row and let
 		// removeStaleManifestEntries (GetAllBlobs inventory) drop truly absent
 		// descriptors later in the same CleanRepo pass.
@@ -1018,10 +1125,26 @@ func (gc GarbageCollect) removeUntaggedManifests(ctx context.Context, repo strin
 // Adds both referenced manifests and referrers from an index.
 // seen ensures each digest is fetched and recursed into at most once per walk,
 // so an index DAG with shared/duplicate child digests stays O(distinct objects).
-func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, repo string,
+func (gc GarbageCollect) identifyManifestsReferencedInIndex(ctx context.Context, index ispec.Index, repo string,
 	referenced map[godigest.Digest]bool, seen map[godigest.Digest]struct{},
 ) error {
+	if zcommon.IsContextDone(ctx) {
+		return ctx.Err()
+	}
+
+	// Nested levels only need work here; root descriptors were Prefetched in cleanRepo.
+	// Skip digests already in seen so Missing children shared by multiple parents
+	// are not Prefetched again (Missing is not memoized).
+	gc.memo(repo).Prefetch(ctx, gc.imgStore, repo, common.UnseenDescriptors(index.Manifests, seen), gc.log)
+	if zcommon.IsContextDone(ctx) {
+		return ctx.Err()
+	}
+
 	for _, desc := range index.Manifests {
+		if zcommon.IsContextDone(ctx) {
+			return ctx.Err()
+		}
+
 		if _, ok := seen[desc.Digest]; ok {
 			continue
 		}
@@ -1029,7 +1152,7 @@ func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, r
 		seen[desc.Digest] = struct{}{}
 
 		if compat.IsImageIndexMediaType(desc.MediaType) {
-			indexImage, err := common.GetImageIndex(gc.imgStore, repo, desc.Digest, gc.log)
+			indexImage, err := gc.memo(repo).GetIndex(gc.imgStore, repo, desc.Digest, gc.log)
 			if err != nil {
 				if errclass.IsBlobUnavailable(err) {
 					gc.log.Warn().Err(err).Str("module", "gc").Str("repository", repo).
@@ -1054,11 +1177,11 @@ func (gc GarbageCollect) identifyManifestsReferencedInIndex(index ispec.Index, r
 				referenced[indexDesc.Digest] = true
 			}
 
-			if err := gc.identifyManifestsReferencedInIndex(indexImage, repo, referenced, seen); err != nil {
+			if err := gc.identifyManifestsReferencedInIndex(ctx, indexImage, repo, referenced, seen); err != nil {
 				return err
 			}
 		} else if compat.IsImageManifestMediaType(desc.MediaType) {
-			image, err := common.GetImageManifest(gc.imgStore, repo, desc.Digest, gc.log)
+			image, err := gc.memo(repo).GetManifest(gc.imgStore, repo, desc.Digest, gc.log)
 			if err != nil {
 				if errclass.IsBlobUnavailable(err) {
 					gc.log.Warn().Err(err).Str("module", "gc").Str("repo", repo).
@@ -1118,13 +1241,14 @@ func (gc GarbageCollect) deleteBlobUploads(repo string, delay time.Duration) (in
 			continue
 		}
 
-		err = gc.imgStore.DeleteBlobUpload(repo, uuid)
+		var deletedUpload bool
+		deletedUpload, err = gc.imgStore.DeleteBlobUploadIfIdle(repo, uuid)
 		if err != nil {
 			gc.log.Error().Err(err).Str("module", "gc").Str("repository", repo).Str("blobUpload", uuid).
 				Str("size", strconv.FormatInt(size, 10)).Str("modified", modtime.String()).Msg("failed to delete blob upload")
 
 			aggregatedErr = errors.Join(aggregatedErr, err)
-		} else {
+		} else if deletedUpload {
 			deleted++
 		}
 	}
@@ -1134,11 +1258,11 @@ func (gc GarbageCollect) deleteBlobUploads(repo string, delay time.Duration) (in
 
 // deleteUnreferencedBlobs deletes from storage all blobs not referenced by the repo's index.json
 // (and nested manifests/indexes), when older than delay.
-func (gc GarbageCollect) deleteUnreferencedBlobs(repo string, delay time.Duration, log zlog.Logger,
+func (gc GarbageCollect) deleteUnreferencedBlobs(ctx context.Context, repo string, delay time.Duration, log zlog.Logger,
 ) (int, error) {
 	gc.log.Debug().Str("module", "gc").Str("repository", repo).Msg("cleaning orphan blobs")
 
-	refBlobs, err := common.GetReferencedBlobs(gc.imgStore, repo, gc.log)
+	refBlobs, err := common.GetReferencedBlobsWithMemo(ctx, gc.memo(repo), gc.imgStore, repo, gc.log)
 	if err != nil {
 		log.Error().Err(err).Str("module", "gc").Str("repository", repo).Msg("failed to get referenced blobs in repo")
 
@@ -1172,7 +1296,7 @@ func (gc GarbageCollect) deleteUnreferencedBlobs(repo string, delay time.Duratio
 			if err != nil {
 				// Skip this candidate; do not abort orphan cleanup for the rest of the repo.
 				log.Warn().Err(err).Str("module", "gc").Str("repository", repo).
-					Str("digest", digest.String()).Msg("skipping orphan blob after StatBlob failure, continuing GC")
+					Str("digest", digest.String()).Msg("skipping orphan blob after StatBlobEntry failure, continuing GC")
 
 				continue
 			}
@@ -1207,15 +1331,18 @@ func isManifestReferencedInIndex(index *ispec.Index, digest godigest.Digest) boo
 func isBlobOlderThan(imgStore types.ImageStore, repo string,
 	digest godigest.Digest, delay time.Duration, log zlog.Logger,
 ) (bool, error) {
-	_, _, modtime, err := imgStore.StatBlob(repo, digest)
+	// Use the per-repo object age, not StatBlob: for remote dedupe placeholders
+	// StatBlob returns the content original's mtime, which can be weeks old and
+	// would bypass gcDelay for freshly linked layers.
+	_, _, modtime, err := imgStore.StatBlobEntry(repo, digest)
 	if err != nil {
 		// Fail closed: do not treat Missing (or Transient/Permanent) as age-eligible —
 		// that would risk deleting live index rows during storage blips.
-		// StatBlob preserves ErrStorage*; IsBlobUnavailable soft-skips use that
+		// StatBlobEntry preserves ErrStorage*; IsBlobUnavailable soft-skips use that
 		// elsewhere. Stale prune can still remove truly absent blobs later when
 		// CleanRepo inventory succeeds.
 		log.Error().Err(err).Str("module", "gc").Str("repository", repo).Str("digest", digest.String()).
-			Msg("failed to stat blob")
+			Msg("failed to stat blob entry")
 
 		return false, err
 	}

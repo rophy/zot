@@ -10,6 +10,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	"zotregistry.dev/zot/v2/pkg/storage/cache"
+	storageCommon "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
@@ -36,6 +38,15 @@ import (
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 	"zotregistry.dev/zot/v2/pkg/test/storageerrclass"
 )
+
+// concurrentReadSafeStore enables Prefetch in GC tests that need cancel-aware warm-up.
+type concurrentReadSafeStore struct {
+	mocks.MockedImageStore
+}
+
+func (s concurrentReadSafeStore) ConcurrentReadSafe() bool {
+	return true
+}
 
 var (
 	errGC    = errors.New("gc error")
@@ -212,7 +223,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				},
 			}, gcOptions, audit, log, metrics)
 
-			_, err := gc.deleteUnreferencedBlobs("repo", time.Hour, log)
+			_, err := gc.deleteUnreferencedBlobs(context.Background(), "repo", time.Hour, log)
 			So(err, ShouldNotBeNil)
 		})
 
@@ -338,11 +349,11 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				StatBlobUploadFn: func(repo, uuid string) (bool, int64, time.Time, error) {
 					return true, 1024, time.Now().Add(-2 * time.Hour), nil
 				},
-				DeleteBlobUploadFn: func(repo, uuid string) error {
+				DeleteBlobUploadIfIdleFn: func(repo, uuid string) (bool, error) {
 					So(uuid, ShouldEqual, uploadUUID)
 					deletedUpload = true
 
-					return nil
+					return true, nil
 				},
 				PutIndexContentFn: func(repo string, index ispec.Index) error {
 					So(deletedUpload, ShouldBeTrue)
@@ -937,11 +948,88 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			// identifyManifestsReferencedInIndex should skip the missing nested index and continue
 			referenced := make(map[godigest.Digest]bool)
-			err := gc.identifyManifestsReferencedInIndex(topLevelIndex, repoName, referenced,
+			err := gc.identifyManifestsReferencedInIndex(context.Background(), topLevelIndex, repoName, referenced,
 				map[godigest.Digest]struct{}{})
 			So(err, ShouldBeNil)
 			// No manifests should be marked as referenced since the nested index is missing
 			So(len(referenced), ShouldEqual, 0)
+		})
+
+		Convey("memo returns nil when memos map is unset", func() {
+			gc := GarbageCollect{}
+			So(gc.memo(repoName), ShouldBeNil)
+		})
+
+		Convey("identifyManifestsReferencedInIndex returns canceled context immediately", func() {
+			gc := NewGarbageCollect(mocks.MockedImageStore{}, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			err := gc.identifyManifestsReferencedInIndex(ctx, ispec.Index{}, repoName,
+				map[godigest.Digest]bool{}, map[godigest.Digest]struct{}{})
+			So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		})
+
+		Convey("identifyManifestsReferencedInIndex returns after Prefetch sees cancel", func() {
+			const descs = 8
+
+			emptyIndex, err := json.Marshal(ispec.Index{SchemaVersion: 2})
+			So(err, ShouldBeNil)
+
+			rootManifests := make([]ispec.Descriptor, 0, descs)
+			for i := range descs {
+				rootManifests = append(rootManifests, ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageIndex,
+					Digest:    godigest.FromString(fmt.Sprintf("identify-cancel-%d", i)),
+				})
+			}
+
+			release := make(chan struct{})
+			var inFlight, maxInFlight atomic.Int64
+
+			imgStore := concurrentReadSafeStore{
+				MockedImageStore: mocks.MockedImageStore{
+					GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+						cur := inFlight.Add(1)
+						for {
+							old := maxInFlight.Load()
+							if cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+								break
+							}
+						}
+
+						<-release
+						inFlight.Add(-1)
+
+						return emptyIndex, nil
+					},
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+			gc.memos.Store(repoName, storageCommon.NewWalkMemo())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error, 1)
+
+			go func() {
+				errCh <- gc.identifyManifestsReferencedInIndex(ctx, ispec.Index{Manifests: rootManifests},
+					repoName, map[godigest.Digest]bool{}, map[godigest.Digest]struct{}{})
+			}()
+
+			deadline := time.Now().Add(2 * time.Second)
+			for maxInFlight.Load() < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+
+			ready := maxInFlight.Load() >= 2
+			cancel()
+			close(release)
+			identifyErr := <-errCh
+
+			So(ready, ShouldBeTrue)
+			So(errors.Is(identifyErr, context.Canceled), ShouldBeTrue)
 		})
 
 		Convey("identifyManifestsReferencedInIndex reads a shared nested index once", func() {
@@ -1000,7 +1088,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
 			referenced := make(map[godigest.Digest]bool)
-			err = gc.identifyManifestsReferencedInIndex(parentIndex, repoName, referenced,
+			err = gc.identifyManifestsReferencedInIndex(context.Background(), parentIndex, repoName, referenced,
 				map[godigest.Digest]struct{}{})
 			So(err, ShouldBeNil)
 			So(readCount, ShouldEqual, 1)
@@ -1971,7 +2059,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
 			referenced := make(map[godigest.Digest]bool)
-			err = gc.identifyManifestsReferencedInIndex(root, repoName, referenced,
+			err = gc.identifyManifestsReferencedInIndex(context.Background(), root, repoName, referenced,
 				map[godigest.Digest]struct{}{})
 			So(err, ShouldBeNil)
 			So(midLeftDigest, ShouldNotEqual, midRightDigest)
@@ -1994,6 +2082,30 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
+		})
+
+		Convey("deleteBlobUploads uses non-blocking upload cleanup", func() {
+			called := false
+			imgStore := mocks.MockedImageStore{
+				ListBlobUploadsFn: func(repo string) ([]string, error) {
+					return []string{"upload-1"}, nil
+				},
+				StatBlobUploadFn: func(repo, uuid string) (bool, int64, time.Time, error) {
+					return true, 1024, time.Now().Add(-2 * time.Hour), nil
+				},
+				DeleteBlobUploadIfIdleFn: func(repo, uuid string) (bool, error) {
+					called = true
+
+					return false, nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			deleted, err := gc.deleteBlobUploads(repoName, time.Hour)
+			So(err, ShouldBeNil)
+			So(deleted, ShouldEqual, 0)
+			So(called, ShouldBeTrue)
 		})
 
 		Convey("Error on GetReferencedBlobs in deleteUnreferencedBlobs", func() {
@@ -2019,7 +2131,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
@@ -2041,7 +2153,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
@@ -2062,7 +2174,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
@@ -2100,12 +2212,12 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
 
-		Convey("StatBlob error in deleteUnreferencedBlobs skips candidate and continues", func() {
+		Convey("StatBlobEntry error in deleteUnreferencedBlobs skips candidate and continues", func() {
 			blobDigest := godigest.FromBytes([]byte("blob-content"))
 
 			returnedIndex := ispec.Index{}
@@ -2119,14 +2231,50 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return []godigest.Digest{blobDigest}, nil
 				},
-				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
 					return false, 0, time.Time{}, errGC
 				},
 			}
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
+			So(err, ShouldBeNil)
+			So(deleted, ShouldEqual, 0)
+		})
+
+		Convey("fresh StatBlobEntry keeps orphan even when StatBlob reports an old original", func() {
+			blobDigest := godigest.FromBytes([]byte("blob-content"))
+
+			returnedIndex := ispec.Index{}
+			returnedIndexBuf, err := json.Marshal(returnedIndex)
+			So(err, ShouldBeNil)
+
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return returnedIndexBuf, nil
+				},
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return []godigest.Digest{blobDigest}, nil
+				},
+				// Content original is weeks old (what StatBlob would return for a placeholder).
+				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 100, time.Now().Add(-14 * 24 * time.Hour), nil
+				},
+				// Per-repo placeholder was written seconds ago.
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+					return true, 0, time.Now().Add(-time.Second), nil
+				},
+				CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
+					So(blobs, ShouldBeEmpty)
+
+					return 0, nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
@@ -2145,7 +2293,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
 					return []godigest.Digest{blobDigest}, nil
 				},
-				StatBlobFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+				StatBlobEntryFn: func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
 					return true, 100, time.Now().Add(-2 * time.Hour), nil
 				},
 				CleanupRepoFn: func(repo string, blobs []godigest.Digest) (int, error) {
@@ -2155,7 +2303,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 
 			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
 
-			deleted, err := gc.deleteUnreferencedBlobs(repoName, time.Hour, log)
+			deleted, err := gc.deleteUnreferencedBlobs(context.Background(), repoName, time.Hour, log)
 			So(err, ShouldNotBeNil)
 			So(deleted, ShouldEqual, 0)
 		})
@@ -2240,10 +2388,10 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 				StatBlobFn: statBlobMissingUnlessPresent(),
 			}
 
-			removedRef := ""
+			var removedRefs []string
 			metaDB := mocks.MetaDBMock{
 				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
-					removedRef = reference
+					removedRefs = append(removedRefs, reference)
 
 					return nil
 				},
@@ -2266,7 +2414,49 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			err := gc.removeStaleManifestEntries(repoName, index)
 			So(err, ShouldBeNil)
 			So(len(index.Manifests), ShouldEqual, 0)
-			So(removedRef, ShouldEqual, "v1.0")
+			// The tag drops that index row. The digest call drops statistics, which a
+			// tag reference would keep.
+			So(removedRefs, ShouldResemble, []string{"v1.0", missingDigest.String()})
+		})
+
+		Convey("removeUnknownMediaTypeManifestEntries keeps statistics while another descriptor remains", func() {
+			sharedDigest := godigest.FromString("shared-blob")
+
+			var removedRefs []string
+			metaDB := mocks.MetaDBMock{
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					removedRefs = append(removedRefs, reference)
+
+					return nil
+				},
+			}
+
+			gc := NewGarbageCollect(mocks.MockedImageStore{}, metaDB, gcOptions, audit, log, metrics)
+
+			index := &ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						Digest:    sharedDigest,
+						MediaType: "application/unknown",
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "bad",
+						},
+					},
+					{
+						Digest:    sharedDigest,
+						MediaType: ispec.MediaTypeImageManifest,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "good",
+						},
+					},
+				},
+			}
+
+			err := gc.removeUnknownMediaTypeManifestEntries(repoName, index)
+			So(err, ShouldBeNil)
+			So(len(index.Manifests), ShouldEqual, 1)
+			So(index.Manifests[0].Annotations[ispec.AnnotationRefName], ShouldEqual, "good")
+			So(removedRefs, ShouldResemble, []string{"bad"})
 		})
 
 		Convey("removeStaleManifestEntries removes cosign signature via DeleteSignature when blob is missing", func() {
@@ -2331,7 +2521,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			}
 
 			deletedSig := false
-			removedRef := ""
+			var removedRefs []string
 			metaDB := mocks.MetaDBMock{
 				DeleteSignatureFn: func(repo string, signedManifestDigest godigest.Digest, sm types.SignatureMetadata) error {
 					deletedSig = true
@@ -2339,7 +2529,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 					return nil
 				},
 				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
-					removedRef = reference
+					removedRefs = append(removedRefs, reference)
 
 					return nil
 				},
@@ -2363,7 +2553,7 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(len(index.Manifests), ShouldEqual, 0)
 			So(deletedSig, ShouldBeFalse)
-			So(removedRef, ShouldEqual, malformedCosignTag)
+			So(removedRefs, ShouldResemble, []string{malformedCosignTag, missingSigDigest.String()})
 		})
 
 		Convey("removeStaleManifestEntries skips in DryRun mode", func() {

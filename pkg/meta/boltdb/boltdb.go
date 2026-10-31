@@ -825,6 +825,35 @@ func (bdw *BoltDB) GetRepoMeta(ctx context.Context, repo string) (mTypes.RepoMet
 	return mConvert.GetRepoMeta(protoRepoMeta), err
 }
 
+func (bdw *BoltDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, references []string,
+	imageMeta mTypes.ImageMeta,
+) (int64, int64, error) {
+	var current, projected int64
+
+	err := bdw.DB.View(func(transaction *bbolt.Tx) error {
+		repoMeta, metaErr := getProtoRepoMeta(repo, transaction.Bucket([]byte(RepoMetaBuck)))
+		if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+			return metaErr
+		}
+
+		repoBlobsBytes := transaction.Bucket([]byte(RepoBlobsBuck)).Get([]byte(repo))
+		repoBlobs, blobsErr := unmarshalProtoRepoBlobs(repo, repoBlobsBytes)
+		if blobsErr != nil {
+			return blobsErr
+		}
+
+		var projectErr error
+		current, projected, projectErr = common.ProjectRepoSize(repoMeta, repoBlobs, references, imageMeta)
+		if projectErr != nil {
+			return projectErr
+		}
+
+		return nil
+	})
+
+	return current, projected, err
+}
+
 func (bdw *BoltDB) GetFullImageMeta(ctx context.Context, repo string, tag string) (mTypes.FullImageMeta, error) {
 	protoRepoMeta := &proto_go.RepoMeta{}
 	protoImageMeta := &proto_go.ImageMeta{}
@@ -1481,8 +1510,10 @@ func (bdw *BoltDB) RemoveRepoReference(repo, reference string, manifestDigest go
 			}
 		}
 
-		/* try to find at least one tag pointing to manifestDigest
-		if not found then we can also remove everything related to this digest */
+		// No remaining tag points at this digest. Signatures and referrers are
+		// deleted either way. Statistics stay when reference is a tag, because that
+		// caller left the manifest in the index. They are deleted when reference is
+		// a digest, because the manifest itself is gone.
 		var foundTag bool
 
 		for _, desc := range protoRepoMeta.Tags {
@@ -1492,7 +1523,10 @@ func (bdw *BoltDB) RemoveRepoReference(repo, reference string, manifestDigest go
 		}
 
 		if !foundTag {
-			delete(protoRepoMeta.Statistics, manifestDigest.String())
+			if common.ReferenceIsDigest(reference) {
+				delete(protoRepoMeta.Statistics, manifestDigest.String())
+			}
+
 			delete(protoRepoMeta.Signatures, manifestDigest.String())
 			delete(protoRepoMeta.Referrers, manifestDigest.String())
 		}

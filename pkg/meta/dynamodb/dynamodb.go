@@ -345,12 +345,23 @@ func (dwr *DynamoDB) setProtoRepoMeta(repo string, repoMeta *proto_go.RepoMeta) 
 }
 
 func (dwr *DynamoDB) getProtoRepoMeta(ctx context.Context, repo string) (*proto_go.RepoMeta, error) {
-	resp, err := dwr.Client.GetItem(ctx, &dynamodb.GetItemInput{
+	return dwr.getProtoRepoMetaWithConsistency(ctx, repo, false)
+}
+
+func (dwr *DynamoDB) getProtoRepoMetaWithConsistency(ctx context.Context, repo string,
+	consistentRead bool,
+) (*proto_go.RepoMeta, error) {
+	input := &dynamodb.GetItemInput{
 		TableName: aws.String(dwr.RepoMetaTablename),
 		Key: map[string]types.AttributeValue{
 			"TableKey": &types.AttributeValueMemberS{Value: repo},
 		},
-	})
+	}
+	if consistentRead {
+		input.ConsistentRead = aws.Bool(true)
+	}
+
+	resp, err := dwr.Client.GetItem(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -563,12 +574,23 @@ func (dwr *DynamoDB) updateRepoLastUpdated(ctx context.Context, repo string, tim
 }
 
 func (dwr *DynamoDB) getProtoRepoBlobs(ctx context.Context, repo string) (*proto_go.RepoBlobs, error) {
-	resp, err := dwr.Client.GetItem(ctx, &dynamodb.GetItemInput{
+	return dwr.getProtoRepoBlobsWithConsistency(ctx, repo, false)
+}
+
+func (dwr *DynamoDB) getProtoRepoBlobsWithConsistency(ctx context.Context, repo string,
+	consistentRead bool,
+) (*proto_go.RepoBlobs, error) {
+	input := &dynamodb.GetItemInput{
 		TableName: aws.String(dwr.RepoBlobsTablename),
 		Key: map[string]types.AttributeValue{
 			"TableKey": &types.AttributeValueMemberS{Value: repo},
 		},
-	})
+	}
+	if consistentRead {
+		input.ConsistentRead = aws.Bool(true)
+	}
+
+	resp, err := dwr.Client.GetItem(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -966,6 +988,28 @@ func (dwr *DynamoDB) GetRepoMeta(ctx context.Context, repo string) (mTypes.RepoM
 	protoRepoMeta.IsStarred = slices.Contains(userStars, repo)
 
 	return mConvert.GetRepoMeta(protoRepoMeta), nil
+}
+
+func (dwr *DynamoDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, references []string,
+	imageMeta mTypes.ImageMeta,
+) (int64, int64, error) {
+	var current, projected int64
+	protoRepoMeta, metaErr := dwr.getProtoRepoMetaWithConsistency(ctx, repo, true)
+	if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+		return 0, 0, metaErr
+	}
+
+	repoBlobs, blobsErr := dwr.getProtoRepoBlobsWithConsistency(ctx, repo, true)
+	if blobsErr != nil {
+		return 0, 0, blobsErr
+	}
+
+	current, projected, err := common.ProjectRepoSize(protoRepoMeta, repoBlobs, references, imageMeta)
+	if err != nil {
+		return current, projected, err
+	}
+
+	return current, projected, nil
 }
 
 func (dwr *DynamoDB) GetFullImageMeta(ctx context.Context, repo string, tag string) (mTypes.FullImageMeta, error) {
@@ -1565,8 +1609,10 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 		}
 	}
 
-	/* try to find at least one tag pointing to manifestDigest
-	if not found then we can also remove everything related to this digest */
+	// No remaining tag points at this digest. Signatures and referrers are
+	// deleted either way. Statistics stay when reference is a tag, because that
+	// caller left the manifest in the index. They are deleted when reference is
+	// a digest, because the manifest itself is gone.
 	var foundTag bool
 
 	for _, desc := range protoRepoMeta.Tags {
@@ -1576,7 +1622,10 @@ func (dwr *DynamoDB) RemoveRepoReference(repo, reference string, manifestDigest 
 	}
 
 	if !foundTag {
-		delete(protoRepoMeta.Statistics, manifestDigest.String())
+		if common.ReferenceIsDigest(reference) {
+			delete(protoRepoMeta.Statistics, manifestDigest.String())
+		}
+
 		delete(protoRepoMeta.Signatures, manifestDigest.String())
 		delete(protoRepoMeta.Referrers, manifestDigest.String())
 	}

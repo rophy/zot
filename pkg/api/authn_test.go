@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io/fs"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/go-jose/go-jose/v4"
 	guuid "github.com/gofrs/uuid"
 	"github.com/golang-jwt/jwt/v5"
 	godigest "github.com/opencontainers/go-digest"
@@ -1064,6 +1066,93 @@ func TestOpenIDAPIKeyTokenExchangeWithBearerOIDC(t *testing.T) {
 	})
 }
 
+func TestOpenIDGroupsFromAccessControlConfig(t *testing.T) {
+	Convey("OpenID users get the permissions of the accessControl groups listing them", t, func() {
+		mockOIDCServer, err := authutils.MockOIDCRun()
+		So(err, ShouldBeNil)
+
+		defer func() {
+			err := mockOIDCServer.Shutdown()
+			if err != nil {
+				panic(err)
+			}
+		}()
+
+		mockOIDCConfig := mockOIDCServer.Config()
+		port := test.GetFreePort()
+
+		conf := config.New()
+		conf.HTTP.Port = port
+		conf.HTTP.Auth = &config.AuthConfig{
+			OpenID: &config.OpenIDConfig{
+				Providers: map[string]config.OpenIDProviderConfig{
+					"oidc": {
+						ClientID:     mockOIDCConfig.ClientID,
+						ClientSecret: mockOIDCConfig.ClientSecret,
+						Issuer:       mockOIDCConfig.Issuer,
+						Scopes:       []string{"openid", "email"},
+					},
+				},
+			},
+		}
+		conf.Storage.RootDirectory = t.TempDir()
+
+		email := mockoidc.DefaultUser().Email
+		So(email, ShouldNotBeEmpty)
+
+		loginAndGetTags := func(groupUsers []string) int {
+			conf.HTTP.AccessControl = &config.AccessControlConfig{
+				Groups: config.Groups{
+					"readers": {
+						Users: groupUsers,
+					},
+				},
+				Repositories: config.Repositories{
+					"team/**": config.PolicyGroup{
+						Policies: []config.Policy{
+							{
+								Groups:  []string{"readers"},
+								Actions: []string{constants.ReadPermission},
+							},
+						},
+						DefaultPolicy: []string{},
+					},
+				},
+			}
+
+			ctlr := api.NewController(conf)
+			cm := test.NewControllerManager(ctlr)
+			baseURL := cm.StartAndWait()
+
+			defer cm.StopServer()
+
+			client := resty.New()
+			client.SetRedirectPolicy(test.CustomRedirectPolicy(20))
+			client.SetHeader(constants.SessionClientHeaderName, constants.SessionClientHeaderValue)
+
+			loginResp, err := client.R().
+				SetQueryParam("provider", "oidc").
+				Get(baseURL + constants.LoginPath)
+			So(err, ShouldBeNil)
+			So(loginResp.StatusCode(), ShouldEqual, http.StatusCreated)
+			client.SetCookies(loginResp.Cookies())
+
+			resp, err := client.R().Get(baseURL + "/v2/team/app/tags/list")
+			So(err, ShouldBeNil)
+
+			return resp.StatusCode()
+		}
+
+		Convey("user listed in the group can read the repository", func() {
+			So(loginAndGetTags([]string{"robot-user", email}), ShouldEqual, http.StatusNotFound)
+		})
+
+		Convey("user not listed in the group can not read the repository", func() {
+			So(loginAndGetTags([]string{"robot-user"}), ShouldEqual, http.StatusForbidden)
+		})
+	})
+}
+
 func TestMultipleAuthorizationHeaders(t *testing.T) {
 	Convey("Test rejection of multiple Authorization headers", t, func() {
 		Convey("Test multiple and single Authorization headers in basic auth handler", func() {
@@ -1752,6 +1841,67 @@ func TestBearerOIDCWorkloadIdentity(t *testing.T) {
 			defer resp.Body.Close()
 
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("OIDC authentication with groups from accessControl config", func() {
+			conf := config.New()
+			conf.HTTP.Port = "0"
+			conf.HTTP.Auth = &config.AuthConfig{
+				Bearer: &config.BearerConfig{
+					OIDC: []config.BearerOIDCConfig{{
+						Issuer:    issuer,
+						Audiences: []string{audience},
+					}},
+				},
+			}
+			conf.HTTP.AccessControl = &config.AccessControlConfig{
+				Groups: config.Groups{
+					"workloads": {
+						// default username mapping is "claims.iss + '/' + claims.sub"
+						Users: []string{issuer + "/" + testSubject},
+					},
+				},
+				Repositories: config.Repositories{
+					"team/**": config.PolicyGroup{
+						Policies: []config.Policy{
+							{
+								Groups:  []string{"workloads"},
+								Actions: []string{constants.ReadPermission},
+							},
+						},
+						DefaultPolicy: []string{},
+					},
+				},
+			}
+			conf.Storage.RootDirectory = t.TempDir()
+
+			ctlr := api.NewController(conf)
+			cm := test.NewControllerManager(ctlr)
+
+			baseURL := cm.StartAndWait()
+			defer cm.StopServer()
+
+			// the token subject is listed in the group
+			token, err := createWorkloadOIDCToken(privKey, issuer, audience, nil)
+			So(err, ShouldBeNil)
+
+			resp, err := resty.R().
+				SetHeader("Authorization", "Bearer "+token).
+				Get(baseURL + "/v2/team/app/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+
+			// the token subject is not listed in the group
+			token, err = createWorkloadOIDCToken(privKey, issuer, audience, map[string]any{
+				"sub": "other-user",
+			})
+			So(err, ShouldBeNil)
+
+			resp, err = resty.R().
+				SetHeader("Authorization", "Bearer "+token).
+				Get(baseURL + "/v2/team/app/tags/list")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusForbidden)
 		})
 
 		Convey("OIDC authentication fails with MetaDB error", func() {
@@ -2898,4 +3048,171 @@ func verifySessionCookiesSecureFlag(cookies []*http.Cookie, expectedSecure bool)
 	So(userCookie, ShouldNotBeNil)
 	So(sessionCookie.Secure, ShouldEqual, expectedSecure)
 	So(userCookie.Secure, ShouldEqual, expectedSecure)
+}
+
+func TestOpenIDSigningAlgsFromDiscovery(t *testing.T) {
+	Convey("OpenID login with an issuer which signs ID tokens with PS512", t, func() {
+		// PS512 is outside the relying party library default (RS256, ES256, PS256),
+		// so it is only accepted when taken from the issuer's discovery document.
+		mockOIDCServer, err := authutils.MockOIDCRunWithIDTokenSigningAlg(jose.PS512)
+		So(err, ShouldBeNil)
+
+		defer func() {
+			err := mockOIDCServer.Shutdown()
+			if err != nil {
+				panic(err)
+			}
+		}()
+
+		mockOIDCConfig := mockOIDCServer.Config()
+		defaultVal := true
+
+		conf := config.New()
+		conf.HTTP.Port = test.GetFreePort()
+		conf.HTTP.Auth = &config.AuthConfig{
+			OpenID: &config.OpenIDConfig{
+				Providers: map[string]config.OpenIDProviderConfig{
+					"oidc": {
+						ClientID:     mockOIDCConfig.ClientID,
+						ClientSecret: mockOIDCConfig.ClientSecret,
+						Issuer:       mockOIDCConfig.Issuer,
+						Scopes:       []string{"openid", "email", "groups"},
+					},
+				},
+			},
+		}
+		conf.Extensions = &extconf.ExtensionConfig{}
+		conf.Extensions.Search = &extconf.SearchConfig{}
+		conf.Extensions.Search.Enable = &defaultVal
+		conf.Extensions.UI = &extconf.UIConfig{}
+		conf.Extensions.UI.Enable = &defaultVal
+		conf.Storage.RootDirectory = t.TempDir()
+
+		Convey("the relying party accepts exactly the algorithms advertised by the issuer", func() {
+			relyingParty := api.NewRelyingPartyOIDC(context.Background(), conf, "oidc", nil, nil, log.NewTestLogger())
+			So(relyingParty, ShouldNotBeNil)
+			So(relyingParty.IDTokenVerifier().SupportedSignAlgs, ShouldResemble, []string{string(jose.PS512)})
+		})
+
+		Convey("login succeeds", func() {
+			ctlr := api.NewController(conf)
+			cm := test.NewControllerManager(ctlr)
+			baseURL := cm.StartAndWait()
+
+			defer cm.StopServer()
+
+			client := resty.New()
+			client.SetRedirectPolicy(test.CustomRedirectPolicy(20))
+
+			resp, err := client.R().
+				SetHeader(constants.SessionClientHeaderName, constants.SessionClientHeaderValue).
+				SetQueryParam("provider", "oidc").
+				Get(baseURL + constants.LoginPath)
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
+			So(resp.Cookies(), ShouldNotBeEmpty)
+		})
+	})
+}
+
+func TestOpenIDProviderUnreachableAtStartup(t *testing.T) {
+	Convey("zot starts and serves other auth methods while the OpenID issuer is unreachable", t, func() {
+		username, seedUser := test.GenerateRandomString()
+		password, seedPass := test.GenerateRandomString()
+		htpasswdPath := test.MakeHtpasswdFileFromString(t, test.GetBcryptCredString(username, password))
+
+		// reserve an address for the issuer, nothing is listening on it yet
+		issuerPort := test.GetFreePort()
+		issuerAddr := "127.0.0.1:" + issuerPort
+
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.HTTP.Auth = &config.AuthConfig{
+			HTPasswd: config.AuthHTPasswd{
+				Path: htpasswdPath,
+			},
+			OpenID: &config.OpenIDConfig{
+				Providers: map[string]config.OpenIDProviderConfig{
+					"oidc": {
+						ClientID:     "zot-client",
+						ClientSecret: "zot-secret",
+						Issuer:       "http://" + issuerAddr + "/oidc",
+						Scopes:       []string{"openid", "email"},
+					},
+				},
+			},
+		}
+		conf.Storage.RootDirectory = t.TempDir()
+
+		ctlr := api.NewController(conf)
+		ctlr.Log.Info().Int64("seedUser", seedUser).Int64("seedPass", seedPass).Msg("random seed for username & password")
+
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		// basic auth keeps working
+		resp, err := resty.R().SetBasicAuth(username, password).Get(baseURL + "/v2/")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		resp, err = resty.R().Get(baseURL + "/v2/")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+
+		login := func() (int, string) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+				baseURL+constants.LoginPath+"?provider=oidc", nil)
+			So(err, ShouldBeNil)
+
+			resp, err := client.Do(req)
+			So(err, ShouldBeNil)
+
+			defer resp.Body.Close()
+
+			return resp.StatusCode, resp.Header.Get("Location")
+		}
+
+		// openid login fails while the issuer is unreachable
+		statusCode, _ := login()
+		So(statusCode, ShouldEqual, http.StatusServiceUnavailable)
+
+		resp, err = resty.R().Get(baseURL + constants.CallbackBasePath + "/oidc")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusServiceUnavailable)
+
+		// unknown providers are still rejected
+		resp, err = resty.R().SetQueryParam("provider", "unknown").Get(baseURL + constants.LoginPath)
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusBadRequest)
+
+		// once the issuer becomes reachable, openid login is initialized on the next attempt
+		rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		So(err, ShouldBeNil)
+
+		mockOIDCServer, err := mockoidc.NewServer(rsaKey)
+		So(err, ShouldBeNil)
+
+		listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", issuerAddr)
+		So(err, ShouldBeNil)
+
+		err = mockOIDCServer.Start(listener, nil)
+		So(err, ShouldBeNil)
+
+		defer func() {
+			_ = mockOIDCServer.Shutdown()
+		}()
+
+		statusCode, location := login()
+		So(statusCode, ShouldEqual, http.StatusFound)
+		So(location, ShouldStartWith, mockOIDCServer.AuthorizationEndpoint())
+	})
 }

@@ -19,6 +19,8 @@ COSIGN_VERSION := 3.0.6
 HELM := $(TOOLSDIR)/bin/helm
 ORAS := $(TOOLSDIR)/bin/oras
 ORAS_VERSION := 1.2.1
+MODCTL := $(TOOLSDIR)/bin/modctl
+MODCTL_VERSION := 0.2.2
 HELM_VERSION := v3.9.1
 REGCLIENT := $(TOOLSDIR)/bin/regctl
 REGCLIENT_VERSION := v0.10.0
@@ -268,8 +270,8 @@ testdata-certs:
 testdata-images: check-skopeo
 	mkdir -p ${TESTDATA}; \
 	cd ${TOP_LEVEL}; \
-	skopeo --insecure-policy copy -q docker://public.ecr.aws/t0x7q1g8/centos:7 oci:${TESTDATA}/zot-test:0.0.1; \
-	skopeo --insecure-policy copy -q docker://public.ecr.aws/t0x7q1g8/centos:8 oci:${TESTDATA}/zot-cve-test:0.0.1; \
+	skopeo --insecure-policy copy -q docker://ghcr.io/project-zot/test-images/centos:7 oci:${TESTDATA}/zot-test:0.0.1; \
+	skopeo --insecure-policy copy -q docker://ghcr.io/project-zot/test-images/centos:8 oci:${TESTDATA}/zot-cve-test:0.0.1; \
 	skopeo --insecure-policy copy -q docker://ghcr.io/project-zot/test-images/java:0.0.1 oci:${TESTDATA}/zot-cve-java-test:0.0.1; \
 	skopeo --insecure-policy copy -q docker://ghcr.io/project-zot/test-images/alpine:3.17.3 oci:${TESTDATA}/alpine:3.17.3; \
 	skopeo --insecure-policy copy -q docker://ghcr.io/project-zot/test-images/spring-web:5.3.31 oci:${TESTDATA}/spring-web:5.3.31; \
@@ -284,7 +286,7 @@ run-bench: $(ZOT_BIN_DEP) $(ZB_DEP)
 	curl --connect-timeout 3 --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 180 --retry-connrefused http://localhost:8080/v2/
 	curl -fsS --retry 5 --retry-delay 1 http://localhost:8080/v2/_catalog
 	curl -fsS http://localhost:8080/v2/_catalog
-	bin/zb-$(OS)-$(ARCH) -c 10 -n 100 -o $(BENCH_OUTPUT) http://localhost:8080
+	bin/zb-$(OS)-$(ARCH) -c 10 -n 100 -o $(BENCH_OUTPUT) --max-timeout-failures 1 http://localhost:8080
 	@if [ -e zot.PID ]; then \
 		kill -TERM $$(cat zot.PID) || true; \
 	fi; \
@@ -309,6 +311,12 @@ $(ORAS):
 	curl -Lo oras.tar.gz https://github.com/oras-project/oras/releases/download/v$(ORAS_VERSION)/oras_$(ORAS_VERSION)_$(OS)_$(ARCH).tar.gz
 	tar xvzf oras.tar.gz -C $(TOOLSDIR)/bin  oras
 	rm oras.tar.gz
+
+$(MODCTL):
+	mkdir -p $(TOOLSDIR)/bin
+	curl -Lo modctl.tar.gz https://github.com/modelpack/modctl/releases/download/v$(MODCTL_VERSION)/modctl-$(MODCTL_VERSION)-$(OS)-$(ARCH).tar.gz
+	tar xvzf modctl.tar.gz -C $(TOOLSDIR)/bin modctl
+	rm modctl.tar.gz
 
 $(HELM):
 	mkdir -p $(TOOLSDIR)/bin
@@ -551,21 +559,25 @@ $(BATS):
 	rm -rf bats-core
 
 # Build skopeo into hack/tools/bin for shared CI artifacts.
+# One binary is shared by Ubuntu 24.04 and 26.04 jobs. The default skopeo
+# build links libgpgme, libassuan, and libdevmapper, and those SONAMEs differ
+# across those releases, so build the CGO-free variant (copy/inspect/delete only).
 $(SKOPEO):
 	mkdir -p $(TOOLSDIR)/bin
 	rm -rf skopeo-src
 	git clone -b $(SKOPEO_VERSION) --depth 1 https://github.com/containers/skopeo.git skopeo-src
-	$(MAKE) -C skopeo-src bin/skopeo
+	CGO_ENABLED=0 $(MAKE) -C skopeo-src bin/skopeo DISABLE_CGO=1 GO_DYN_FLAGS=
 	cp skopeo-src/bin/skopeo $(SKOPEO)
 	chmod +x $(SKOPEO)
 	rm -rf skopeo-src
 
 .PHONY: check-blackbox-prerequisites
-check-blackbox-prerequisites: check-linux check-skopeo $(BATS) $(REGCLIENT) $(ORAS) $(HELM) $(CRICTL) $(NOTATION) $(COSIGN) $(STACKER) $(KIND)
+check-blackbox-prerequisites: check-linux check-skopeo $(BATS) $(REGCLIENT) $(ORAS) $(MODCTL) $(HELM) $(CRICTL) $(NOTATION) $(COSIGN) $(STACKER) $(KIND)
 	which skopeo && skopeo --version; \
 	which stacker && stacker --version; \
 	which regctl && regctl version; \
 	which oras && oras version; \
+	which modctl && modctl version; \
 	which helm && helm version; \
 	which crictl && crictl version; \
 	which notation && notation version; \
@@ -574,7 +586,7 @@ check-blackbox-prerequisites: check-linux check-skopeo $(BATS) $(REGCLIENT) $(OR
 
 # Download blackbox client tools into hack/tools/bin (includes skopeo for CI artifacts).
 .PHONY: blackbox-tools
-blackbox-tools: $(BATS) $(REGCLIENT) $(ORAS) $(HELM) $(CRICTL) $(NOTATION) $(COSIGN) $(STACKER) $(KIND) $(SKOPEO)
+blackbox-tools: $(BATS) $(REGCLIENT) $(ORAS) $(MODCTL) $(HELM) $(CRICTL) $(NOTATION) $(COSIGN) $(STACKER) $(KIND) $(SKOPEO)
 
 .PHONY: run-blackbox-tests
 run-blackbox-tests: $(BATS_TEST_FILE_PATH) check-blackbox-prerequisites $(ZOT_BIN_DEP) $(ZOT_MIN_DEP) $(ZLI_DEP) $(ZB_DEP)
