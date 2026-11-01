@@ -12,7 +12,7 @@ entry once it is merged upstream or dropped.
 | 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`b8dbe75f`) | **on hold until reproduced**: fix done, but the flake is too rare to justify a PR yet (see below) |
 | 7 | Leaked controller in `TestDerivedImageListGqlAuthorization` | none | noticed only: its htpasswd watcher keeps polling a deleted file during later tests |
 | 8 | Per-store storage usage metric, dedupe-aware (issue #4523) | none | proposal posted 2026-10-07 (local first, initial value from `PopulateStorageMetrics` walk, hook updates; S3 later); waiting for maintainers, no code yet |
-| 11 | `skipUpstreamIfLocal` for on-demand sync (issue #4128) | `feat/sync-skip-upstream-if-local` (`8a13f03e`), upstream `pr/sync-skip-upstream-if-local` (`61e65269`, on upstream `main` `6b76ca1f`) | upstream PR #4646 opened 2026-11-01; overlaps #4612 (`ShouldCheckUpstream`, same files), whichever merges second needs a small rebase; #4128 marked stale 2026-10-31 |
+| 11 | `skipUpstreamIfLocal` for on-demand sync (issue #4128) | `feat/sync-skip-upstream-if-local` (`25cc96f0`), upstream `pr/sync-skip-upstream-if-local` (`6b134968`, on upstream `main` `6b76ca1f`) | upstream PR #4646 opened 2026-11-01; Copilot finding (overlapping rules picked the wrong tag filters) fixed in 6b134968, thread resolved; overlaps #4612 (`ShouldCheckUpstream`, same files), whichever merges second needs a small rebase; #4128 marked stale 2026-10-31 |
 
 `staging` (`ab29194e`) = `develop` (older) + issues 4, 5, 6. Its last CI run
 (https://github.com/rophy/zot/actions/runs/36436324063): minimal suite passed; extended suite
