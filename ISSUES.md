@@ -9,7 +9,7 @@ entry once it is merged upstream or dropped.
 | --- | --- | --- | --- |
 | 4 | GC on demand API (issue #4472) | `feat/gc-trigger-api` (`e6c6a63f`), upstream-ready `pr/gc-trigger-api` (`8413468a`, on `v2.1.23`), body in `../zot-gc/pr.md` | squashed; 3 CodeRabbit reviews on fork PR rophy/zot#1 (closed) all resolved; deleted counts split off to `feat/gc-status-deleted-counts` as a possible follow-up; rebased 2026-10-07 (fixed a nil `sweep` panic in upstream test from #4514), upstream PR #4522 opened 2026-10-07; coverage tests added 2026-10-11; rebased on main 2026-10-13 for the new codecov config (#4532); Copilot review fixes pushed 2026-10-16 (adminPolicy via AuthzOnlyAdminsMiddleware, CORS, StatIndex, test ports; shutdown race answered, not changed), replies drafted, not posted; rebased on v2.1.23 2026-11-02 (import conflict in `gc.go`) |
 | 5 | `TestEventRecorderReload` race fix | `feat/fix-events-reload-test` (`5604fcac`), upstream `pr/fix-events-reload-test` (`3d0a9fec`, on `v2.1.23`) | upstream PR #4660 opened 2026-11-03; the post-reload connection count raced (sink signals before responding): 300/300 failures with `GOMAXPROCS=1`, no upstream CI failure counted; now compares the installed delegate (`ShouldPointTo`) |
-| 6 | `TestScheduler` flaky test fix | `feat/fix-scheduler-fairness-test` (`006d4127`) | **on hold until reproduced**: fix done, but the flake is too rare to justify a PR yet (see below) |
+| 6 | `TestScheduler` race fix | `feat/fix-scheduler-fairness-test` (`006d4127`), upstream `pr/fix-scheduler-fairness-test` (`ea5a6bcd`, on `v2.1.23`) | upstream PR #4661 opened 2026-11-03; reproduced with `GOMAXPROCS=2` (25/30 failures at the line 258 check, as in upstream run 32722842702), 0/30 with the fix |
 | 7 | Leaked controller in `TestDerivedImageListGqlAuthorization` | none | noticed only: its htpasswd watcher keeps polling a deleted file during later tests |
 | 8 | Per-store storage usage metric, dedupe-aware (issue #4523) | none | proposal posted 2026-10-07 (local first, initial value from `PopulateStorageMetrics` walk, hook updates; S3 later); waiting for maintainers, no code yet |
 | 11 | `skipUpstreamIfLocal` for on-demand sync (issue #4128) | `feat/sync-skip-upstream-if-local` (`2fe9400c`), upstream `pr/sync-skip-upstream-if-local` (`25724e2a`, on `v2.1.23`) | upstream PR #4646 opened 2026-11-01; Copilot finding (overlapping rules picked the wrong tag filters) fixed in 6b134968, thread resolved; overlaps #4612 (`ShouldCheckUpstream`, same files), whichever merges second needs a small rebase; #4128 marked stale 2026-10-31 |
@@ -22,19 +22,3 @@ upstream (#4483). No staging image has been pushed yet (`ghcr.io/rophy/zot:stagi
 Issues 4 and 6 both add an import to `pkg/scheduler/scheduler_test.go`; whichever merges upstream
 second needs a trivial rebase.
 
-## Issue 6: `TestScheduler` flake, on hold
-
-The fairness check (`scheduler_test.go:258` on upstream `main`) reads the task log order, which
-depends on worker timing; the fix checks the order the scheduler picked generators in instead.
-Evidence collected 2026-09-29 (not enough for an upstream PR):
-
-- Upstream CI (runners with 8/16 cores): 1 failure in ~1000 `test.yaml` runs since 2026-07-16,
-  run 32722842702 (PR #4351, 2026-08-24). Searched all failed runs and failed first attempts of
-  re-run runs; the other `pkg/scheduler` failures were `[build failed]`.
-- Fork staging CI (4-core `ubuntu-latest`): 1 failure in 3 minimal runs (run 36420507713 attempt 2).
-- Experiment branch `ci/scheduler-flake` (workflow `scheduler-flake.yaml`: minimal suite, 5 runs on
-  `develop` + 5 with the fix): run 36581242896, 0/5 unfixed failures, 0/5 fixed.
-
-Resume when it reproduces: re-run the experiment (`gh run rerun <id> --repo rophy/zot`) or push to
-`ci/scheduler-flake` for more samples; each job reports `TestScheduler <variant> <n>: PASS|FAIL` in
-the run summary. Then open a PR with the failure rate before and after the fix.
