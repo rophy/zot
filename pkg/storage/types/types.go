@@ -65,6 +65,10 @@ type ImageStore interface { //nolint:interfacebloat
 	PutImageManifest(ctx context.Context, repo, reference, mediaType string, body []byte, extraTags []string) (
 		godigest.Digest, godigest.Digest, error)
 	DeleteImageManifest(ctx context.Context, repo, reference string, detectCollision bool) error
+	// RetagManifest points reference at an existing digest already present in the repository
+	// index (typically an untagged descriptor left by a tag overwrite). It does not write
+	// blobs, run the linter, or emit image-updated events.
+	RetagManifest(ctx context.Context, repo, reference string, digest godigest.Digest) error
 	BlobUploadPath(repo, uuid string) string
 	StatBlobUpload(repo, uuid string) (bool, int64, time.Time, error)
 	ListBlobUploads(repo string) ([]string, error)
@@ -80,6 +84,10 @@ type ImageStore interface { //nolint:interfacebloat
 	DeleteBlobUploadIfIdle(repo, uuid string) (bool, error)
 	BlobPath(repo string, digest godigest.Digest) string
 	CheckBlob(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
+	// CheckBlobWithSize is CheckBlob for a blob whose size is already known, e.g. from its descriptor.
+	// It compares the stored blob against size instead of looking the descriptor up in the repository.
+	// A negative size means the size is unknown, same as CheckBlob.
+	CheckBlobWithSize(ctx context.Context, repo string, digest godigest.Digest, size int64) (bool, int64, error)
 	StatBlob(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
 	// StatBlobEntry stats the object at BlobPath(repo, digest) without resolving through
 	// the dedupe cache to a content original. Use it for age checks (GC delay, idle-repo

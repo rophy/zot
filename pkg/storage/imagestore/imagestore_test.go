@@ -3,6 +3,7 @@ package imagestore_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -827,6 +828,164 @@ func TestCheckBlobTransientSkipsCacheFallback(t *testing.T) {
 		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeFalse)
 		So(cacheLookups, ShouldEqual, 0)
 		So(putContentCalls, ShouldEqual, 0)
+	})
+}
+
+// TestCheckBlobWithSize checks that a known size replaces the descriptor lookup, which reads
+// index.json and then the manifests of the repo, while CheckBlob keeps doing that lookup.
+func TestCheckBlobWithSize(t *testing.T) {
+	Convey("CheckBlobWithSize compares against the given size without reading the repo", t, func() {
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		rootDir := t.TempDir()
+
+		digest := godigest.FromString("checkblob-with-size")
+		blobPath := path.Join(rootDir, "repo", ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+
+		var contentReads []string
+
+		storeMock := &mocks.StorageDriverMock{
+			StatFn: func(_ context.Context, statPath string) (driver.FileInfo, error) {
+				So(statPath, ShouldEqual, blobPath)
+
+				return &mocks.FileInfoMock{SizeFn: func() int64 { return 5 }}, nil
+			},
+			GetContentFn: func(_ context.Context, contentPath string) ([]byte, error) {
+				contentReads = append(contentReads, contentPath)
+
+				return nil, driver.PathNotFoundError{Path: contentPath}
+			},
+		}
+
+		store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
+			gcs.New(storeMock), nil, nil, nil)
+		So(store, ShouldNotBeNil)
+
+		ctx := context.Background()
+
+		Convey("blob with the expected size is found", func() {
+			ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, 5)
+			So(err, ShouldBeNil)
+			So(ok, ShouldBeTrue)
+			So(size, ShouldEqual, 5)
+			So(contentReads, ShouldBeEmpty)
+		})
+
+		Convey("blob with a different size is reported as not found", func() {
+			for _, expectedSize := range []int64{0, 4, 6} {
+				ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, expectedSize)
+				So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
+				So(ok, ShouldBeFalse)
+				So(size, ShouldEqual, -1)
+			}
+
+			So(contentReads, ShouldBeEmpty)
+		})
+
+		Convey("unknown size falls back to the descriptor lookup", func() {
+			ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, -1)
+			So(err, ShouldBeNil)
+			So(ok, ShouldBeTrue)
+			So(size, ShouldEqual, 5)
+			So(contentReads, ShouldResemble, []string{path.Join(rootDir, "repo", ispec.ImageIndexFile)})
+		})
+
+		Convey("CheckBlob keeps the descriptor lookup", func() {
+			ok, size, err := store.CheckBlob(ctx, "repo", digest)
+			So(err, ShouldBeNil)
+			So(ok, ShouldBeTrue)
+			So(size, ShouldEqual, 5)
+			So(contentReads, ShouldResemble, []string{path.Join(rootDir, "repo", ispec.ImageIndexFile)})
+		})
+	})
+}
+
+// TestCheckBlobWithSizeCacheOrigin checks that a known size is also compared against content found
+// through the dedupe cache, both when the blob is missing from the repo and when it is a placeholder.
+func TestCheckBlobWithSizeCacheOrigin(t *testing.T) {
+	Convey("CheckBlobWithSize compares content found through the dedupe cache", t, func() {
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		rootDir := t.TempDir()
+
+		digest := godigest.FromString("checkblob-with-size-cache-origin")
+		blobPath := path.Join(rootDir, "repo", ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+		cacheHitPath := path.Join(rootDir, "origin", ispec.ImageBlobsDir, digest.Algorithm().String(), digest.Encoded())
+
+		for _, testCase := range []struct {
+			name     string
+			blobInfo func(statPath string) (driver.FileInfo, error)
+		}{
+			{
+				name: "blob missing from the repo",
+				blobInfo: func(statPath string) (driver.FileInfo, error) {
+					return nil, driver.PathNotFoundError{Path: statPath}
+				},
+			},
+			{
+				name: "blob is a placeholder",
+				blobInfo: func(string) (driver.FileInfo, error) {
+					return &mocks.FileInfoMock{SizeFn: func() int64 { return 0 }}, nil
+				},
+			},
+		} {
+			Convey(testCase.name, func() {
+				var putBlobs []string
+
+				storeMock := &mocks.StorageDriverMock{
+					StatFn: func(_ context.Context, statPath string) (driver.FileInfo, error) {
+						switch statPath {
+						case blobPath:
+							return testCase.blobInfo(statPath)
+						case cacheHitPath:
+							return &mocks.FileInfoMock{SizeFn: func() int64 { return 42 }}, nil
+						default:
+							// initRepo layout/index: absent so WriteFile creates them.
+							return nil, driver.PathNotFoundError{Path: statPath}
+						}
+					},
+				}
+
+				store := imagestore.NewImageStore(rootDir, "", true, false, log, metrics, nil,
+					gcs.New(storeMock), mocks.CacheMock{
+						GetBlobFn: func(godigest.Digest) (string, error) {
+							return cacheHitPath, nil
+						},
+						PutBlobFn: func(_ godigest.Digest, putPath string) error {
+							putBlobs = append(putBlobs, putPath)
+
+							return nil
+						},
+						HasBlobFn: func(godigest.Digest, string) bool { return true },
+					}, nil, nil)
+
+				ctx := context.Background()
+
+				Convey("origin with the expected size is found", func() {
+					ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, 42)
+					So(err, ShouldBeNil)
+					So(ok, ShouldBeTrue)
+					So(size, ShouldEqual, 42)
+					So(putBlobs, ShouldResemble, []string{blobPath})
+				})
+
+				Convey("origin with a different size is reported as not found", func() {
+					ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, 41)
+					So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
+					So(ok, ShouldBeFalse)
+					So(size, ShouldEqual, -1)
+					So(putBlobs, ShouldBeEmpty)
+				})
+
+				Convey("unknown size accepts the origin", func() {
+					ok, size, err := store.CheckBlobWithSize(ctx, "repo", digest, -1)
+					So(err, ShouldBeNil)
+					So(ok, ShouldBeTrue)
+					So(size, ShouldEqual, 42)
+					So(putBlobs, ShouldResemble, []string{blobPath})
+				})
+			})
+		}
 	})
 }
 
@@ -1764,5 +1923,225 @@ func TestFullBlobUploadStagingCleanup(t *testing.T) {
 		So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
 		So(len(deleted), ShouldEqual, 1)
 		So(strings.Contains(deleted[0], ".uploads"), ShouldBeTrue)
+	})
+}
+
+func TestRetagManifest(t *testing.T) {
+	Convey("RetagManifest", t, func() {
+		newStore := func(rootDir string) storageTypes.ImageStore {
+			return imagestore.NewImageStore(rootDir, "", false, false, zlog.NewTestLogger(),
+				monitoring.NewNopMetricServer(), nil, local.New(true), nil, nil, nil)
+		}
+
+		Convey("rejects empty reference or digest", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			digest := godigest.FromString("manifest")
+			So(errors.Is(store.RetagManifest(ctx, "repo", "", digest), zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(store.RetagManifest(ctx, "repo", "latest", ""), zerr.ErrBadManifest), ShouldBeTrue)
+		})
+
+		Convey("returns repo error when the repository layout is missing", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+
+			err := store.RetagManifest(ctx, "missing", "latest", godigest.FromString("manifest"))
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("returns an error when index.json cannot be read", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+			So(os.WriteFile(path.Join(rootDir, "repo", ispec.ImageIndexFile), []byte("{"), 0o600), ShouldBeNil)
+
+			err := store.RetagManifest(ctx, "repo", "latest", godigest.FromString("manifest"))
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("returns ErrManifestNotFound when the digest is absent", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			err := store.RetagManifest(ctx, "repo", "latest", godigest.FromString("missing"))
+			So(errors.Is(err, zerr.ErrManifestNotFound), ShouldBeTrue)
+		})
+
+		indexByTag := func(store storageTypes.ImageStore, repo, tag string) (ispec.Descriptor, bool) {
+			buf, err := store.GetIndexContent(repo)
+			So(err, ShouldBeNil)
+
+			var index ispec.Index
+			So(json.Unmarshal(buf, &index), ShouldBeNil)
+
+			for _, desc := range index.Manifests {
+				if name, ok := desc.Annotations[ispec.AnnotationRefName]; ok && name == tag {
+					return desc, true
+				}
+			}
+
+			return ispec.Descriptor{}, false
+		}
+
+		Convey("reattaches a tag to an untagged digest left by overwrite", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			prior := godigest.FromString("prior")
+			newer := godigest.FromString("newer")
+			index := ispec.Index{
+				SchemaVersion: 2,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    prior,
+						Size:      1,
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    newer,
+						Size:      1,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "latest",
+						},
+					},
+				},
+			}
+			So(store.PutIndexContent("repo", index), ShouldBeNil)
+
+			So(store.DeleteImageManifest(ctx, "repo", "latest", false), ShouldBeNil)
+			So(store.RetagManifest(ctx, "repo", "latest", prior), ShouldBeNil)
+
+			desc, ok := indexByTag(store, "repo", "latest")
+			So(ok, ShouldBeTrue)
+			So(desc.Digest, ShouldEqual, prior)
+		})
+
+		Convey("prefers an untagged row when the digest is also tagged elsewhere", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			shared := godigest.FromString("shared")
+			index := ispec.Index{
+				SchemaVersion: 2,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    shared,
+						Size:      1,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "v1",
+							"extra":                 "from-tagged",
+						},
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    shared,
+						Size:      1,
+						Annotations: map[string]string{
+							"extra": "from-untagged",
+						},
+					},
+				},
+			}
+			So(store.PutIndexContent("repo", index), ShouldBeNil)
+
+			So(store.RetagManifest(ctx, "repo", "latest", shared), ShouldBeNil)
+
+			latest, ok := indexByTag(store, "repo", "latest")
+			So(ok, ShouldBeTrue)
+			So(latest.Digest, ShouldEqual, shared)
+			So(latest.Annotations["extra"], ShouldEqual, "from-untagged")
+
+			v1, ok := indexByTag(store, "repo", "v1")
+			So(ok, ShouldBeTrue)
+			So(v1.Digest, ShouldEqual, shared)
+		})
+
+		Convey("drops an existing tag owner and clones a nil-annotation descriptor", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			prior := godigest.FromString("prior")
+			newer := godigest.FromString("newer")
+			index := ispec.Index{
+				SchemaVersion: 2,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    prior,
+						Size:      1,
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    newer,
+						Size:      1,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "latest",
+						},
+					},
+				},
+			}
+			So(store.PutIndexContent("repo", index), ShouldBeNil)
+
+			// Retag without deleting first: drop the current latest owner, then attach prior.
+			So(store.RetagManifest(ctx, "repo", "latest", prior), ShouldBeNil)
+
+			latest, ok := indexByTag(store, "repo", "latest")
+			So(ok, ShouldBeTrue)
+			So(latest.Digest, ShouldEqual, prior)
+			So(latest.Annotations[ispec.AnnotationRefName], ShouldEqual, "latest")
+		})
+
+		Convey("clones a tagged-only digest when no untagged row exists", func() {
+			rootDir := t.TempDir()
+			store := newStore(rootDir)
+			ctx := context.Background()
+			So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+			shared := godigest.FromString("shared-tagged-only")
+			index := ispec.Index{
+				SchemaVersion: 2,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    shared,
+						Size:      1,
+						Annotations: map[string]string{
+							ispec.AnnotationRefName: "v1",
+						},
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    godigest.FromString("other"),
+						Size:      1,
+					},
+				},
+			}
+			So(store.PutIndexContent("repo", index), ShouldBeNil)
+
+			So(store.RetagManifest(ctx, "repo", "latest", shared), ShouldBeNil)
+
+			latest, ok := indexByTag(store, "repo", "latest")
+			So(ok, ShouldBeTrue)
+			So(latest.Digest, ShouldEqual, shared)
+
+			v1, ok := indexByTag(store, "repo", "v1")
+			So(ok, ShouldBeTrue)
+			So(v1.Digest, ShouldEqual, shared)
+		})
 	})
 }

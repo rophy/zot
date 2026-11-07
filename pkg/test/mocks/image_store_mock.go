@@ -27,6 +27,7 @@ type MockedImageStore struct {
 	PutImageManifestFn    func(ctx context.Context, repo string, reference string, mediaType string, body []byte,
 		extraTags []string) (godigest.Digest, godigest.Digest, error)
 	DeleteImageManifestFn  func(ctx context.Context, repo string, reference string, detectCollision bool) error
+	RetagManifestFn        func(ctx context.Context, repo, reference string, digest godigest.Digest) error
 	BlobUploadPathFn       func(repo string, uuid string) string
 	StatBlobUploadFn       func(repo string, uuid string) (bool, int64, time.Time, error)
 	ListBlobUploadsFn      func(repo string) ([]string, error)
@@ -44,9 +45,11 @@ type MockedImageStore struct {
 	DeleteBlobUploadIfIdleFn func(repo string, uuid string) (bool, error)
 	BlobPathFn               func(repo string, digest godigest.Digest) string
 	CheckBlobFn              func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
-	StatBlobFn               func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
-	StatBlobEntryFn          func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
-	GetBlobPartialFn         func(repo string, digest godigest.Digest, mediaType string, from, to int64,
+	CheckBlobWithSizeFn      func(ctx context.Context, repo string, digest godigest.Digest,
+		size int64) (bool, int64, error)
+	StatBlobFn       func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	StatBlobEntryFn  func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	GetBlobPartialFn func(repo string, digest godigest.Digest, mediaType string, from, to int64,
 	) (io.ReadCloser, int64, int64, error)
 	GetBlobFn            func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error)
 	DeleteBlobFn         func(repo string, digest godigest.Digest) error
@@ -222,6 +225,14 @@ func (is MockedImageStore) DeleteImageManifest(ctx context.Context, name string,
 	return nil
 }
 
+func (is MockedImageStore) RetagManifest(ctx context.Context, repo, reference string, digest godigest.Digest) error {
+	if is.RetagManifestFn != nil {
+		return is.RetagManifestFn(ctx, repo, reference, digest)
+	}
+
+	return nil
+}
+
 func (is MockedImageStore) ListBlobUploads(repo string) ([]string, error) {
 	if is.ListBlobUploadsFn != nil {
 		return is.ListBlobUploadsFn(repo)
@@ -340,6 +351,15 @@ func (is MockedImageStore) BlobPath(repo string, digest godigest.Digest) string 
 func (is MockedImageStore) CheckBlob(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error) {
 	if is.CheckBlobFn != nil {
 		return is.CheckBlobFn(ctx, repo, digest)
+	}
+
+	return true, 0, nil
+}
+
+func (is MockedImageStore) CheckBlobWithSize(ctx context.Context, repo string, digest godigest.Digest, size int64,
+) (bool, int64, error) {
+	if is.CheckBlobWithSizeFn != nil {
+		return is.CheckBlobWithSizeFn(ctx, repo, digest, size)
 	}
 
 	return true, 0, nil
