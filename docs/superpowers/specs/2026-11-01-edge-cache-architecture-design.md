@@ -5,7 +5,7 @@
 | Date | 2026-11-01 |
 | Status | Design agreed; not deployed or tested |
 | Scope | Corporate, on-premises: one origin registry, up to about 10 sites |
-| zot version | Current `main` plus PR #4646 (unreleased features are allowed) |
+| zot version | Current `main`: v2.1.23 plus PR #4646 (merged 2026-11-08, not yet released) |
 
 ## 1. Requirements and decisions
 
@@ -62,8 +62,8 @@ also works.
 
 ## 3. Request flow and failure behavior
 
-1. **Hit:** the node serves the image from its local disk. With `skipUpstreamIfLocal`, it does not
-   contact the origin.
+1. **Hit:** the node serves the image from its local disk. With `manifestCheckInterval: -1`, it does
+   not contact the origin.
 2. **Miss:** the node fetches the image from the origin and serves it. With `stream`, the client
    receives data while the node downloads. Concurrent pulls of the same image on one node share one
    fetch. The two nodes do not share fetches, so the origin sends an image at most twice per site.
@@ -84,7 +84,7 @@ differ between sites.
 | Setting | Value | Reason |
 |---|---|---|
 | `onDemand` | `true` | Fetch an image when a client first requests it. |
-| `skipUpstreamIfLocal` | `true` | A stored tag is served without contacting the origin. Pinned tags never change, so the check has no value, and it fails or waits when the origin is slow or down. Added by PR #4646. |
+| `manifestCheckInterval` | `-1` | A stored tag is served without contacting the origin. Pinned tags never change, so the check has no value, and it fails or waits when the origin is slow or down. A negative value was added by PR #4646. |
 | `content` | `**`, or only the origin projects the site needs | Limits what the site can cache. |
 | `credentialsFile` | A read-only robot account on the origin | The edge syncs with its own credential; it never forwards the client's identity. |
 | `tlsVerify` | `true` | Required by `stream`. |
@@ -93,8 +93,9 @@ differ between sites.
 If `stream` is not used, set `maxRetries` low, so that a miss fails quickly when the origin is down
 instead of after minutes of retries.
 
-If PR #4646 is not available, `manifestCheckInterval` (for example `24h`) is the closest option: it
-checks the origin once per interval for each tag instead of on every pull.
+On a version without PR #4646 (v2.1.23 or older), a positive `manifestCheckInterval` (for example
+`24h`) is the closest option: it checks the origin once per interval for each tag instead of on every
+pull.
 
 ### HTTP server
 
@@ -200,7 +201,7 @@ Run these on a test setup with the origin and one site of two nodes:
 
 | Risk | Mitigation |
 |---|---|
-| The design depends on unreleased features (`stream`, `skipUpstreamIfLocal`, `shutdownTimeout`); they can change before release, and PR #4646 is still in review. | Pin the build; repeat section 8 for each new version. |
+| The design depends on a negative `manifestCheckInterval` (PR #4646), which is merged but not yet released, and on `stream` and `shutdownTimeout`, which are new in v2.1.23. | Pin the build; repeat section 8 for each new version. |
 | `stream` is new code; its behavior with interrupted clients is not known. | Validation tests 2 and 4. |
 | No disk size limit: a burst of new images can fill the disk before retention runs. | Disk alerts; size for the retention window; the GC API (PR #4522) when available. |
 | HA at VM sites depends on health-checked DNS or a floating IP, outside zot. | Choose one per site before rollout. |
@@ -209,7 +210,7 @@ Run these on a test setup with the origin and one site of two nodes:
 
 - Warm-cache benchmark: rophy/zot-perf-test, `docs/results/edge-cache-warm-throughput-report.md`.
 - Cold-pull benchmark: rophy/zot-perf-test, `docs/results/edge-cache-cold-pull-report.md`.
-- zot PRs: #4407 (`stream`), #4638 (`shutdownTimeout`), #4646 (`skipUpstreamIfLocal`), #4522
+- zot PRs: #4407 (`stream`), #4638 (`shutdownTimeout`), #4646 (negative `manifestCheckInterval`), #4522
   (GC API), #4410 (sparse on-demand sync of multi-arch indexes).
 - zot configuration reference: `examples/README.md` (sync, retention, authentication, access
   control).
