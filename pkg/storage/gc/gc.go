@@ -1411,6 +1411,11 @@ type GCTaskGenerator struct {
 	maxDelay          time.Duration
 	timeWindow        config.GCTimeWindow
 	loggedWindowDefer bool
+	// nextRepo and nextRepoErr are the result of looking up the repository to hand out next,
+	// if nextRepoKnown, looked up with the previous one.
+	nextRepo      string
+	nextRepoErr   error
+	nextRepoKnown bool
 	// sweep tracks the status of the current or last sweep.
 	sweep sweepState
 	// forceSweep lets the next sweep start outside the time window, when requested on demand.
@@ -1442,7 +1447,12 @@ func (gen *GCTaskGenerator) Next() (scheduler.Task, error) {
 
 	gen.nextRun = time.Now().Add(delay)
 
-	repo, err := gen.imgStore.GetNextRepository(gen.processedRepos)
+	repo, err := gen.nextRepo, gen.nextRepoErr
+	if !gen.nextRepoKnown {
+		repo, err = gen.imgStore.GetNextRepository(gen.processedRepos)
+	}
+
+	gen.nextRepoKnown = false
 
 	if len(gen.processedRepos) == 0 {
 		gen.sweep.start()
@@ -1465,6 +1475,15 @@ func (gen *GCTaskGenerator) Next() (scheduler.Task, error) {
 	}
 
 	gen.processedRepos[repo] = struct{}{}
+
+	// Look up the next repository now, so that after the last one the call which ends the sweep
+	// doesn't wait for the delay. The next call returns the result, error included.
+	gen.nextRepo, gen.nextRepoErr = gen.imgStore.GetNextRepository(gen.processedRepos)
+	gen.nextRepoKnown = true
+
+	if gen.nextRepo == "" && gen.nextRepoErr == nil {
+		gen.nextRun = time.Now()
+	}
 
 	gen.sweep.taskStarted()
 
@@ -1518,6 +1537,7 @@ func (gen *GCTaskGenerator) Reset() {
 	gen.processedRepos = make(map[string]struct{})
 	gen.done = false
 	gen.nextRun = time.Time{}
+	gen.nextRepo, gen.nextRepoErr, gen.nextRepoKnown = "", nil, false
 }
 
 type gcTask struct {
