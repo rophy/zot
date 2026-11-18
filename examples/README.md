@@ -49,6 +49,7 @@ Examples of working configurations for various use cases are available [here](..
     - [Specifying S3 credentials](#specifying-s3-credentials)
   - [Sync](#sync)
   - [Search and CVE scanning (Trivy)](#search-and-cve-scanning-trivy)
+  - [Lint](#lint)
 
 ## Generated JSON Schema
 
@@ -794,6 +795,22 @@ To activate API keys use:
   }
 ```
 
+To cap the lifetime of API keys, set `apikeyMaxLifetime` (a Go duration, like `720h`):
+
+```
+  "http": {
+    "auth": {
+      "apikey": true,
+      "apikeyMaxLifetime": "720h"
+    }
+  }
+```
+
+A key created with no expiration date, or a later one, gets the expiration date now + `apikeyMaxLifetime`.
+A key older than `apikeyMaxLifetime` is refused, also if it was created before the setting.
+The stored key is not changed, so raising or removing the setting makes it work again.
+If not set, keys can be created without expiry.
+
 ##### How to create an API Key
 
 Create an API key for the current user using the REST API
@@ -809,7 +826,7 @@ POST /zot/auth/apikey
 Body: {"label": "git", "scopes": ["repo1", "repo2"], "expirationDate": "2023-08-28T17:10:05+03:00"}'
 ```
 
-The time format of expirationDate is RFC1123Z.
+The time format of expirationDate is RFC 3339.
 
 **Example cURL without expiration date**
 
@@ -1507,6 +1524,7 @@ Configure each registry sync:
 				"disableHTTP2": true,               # force HTTP/1.1 to the upstream, so each concurrent request opens its own TCP connection instead of sharing the single connection (and congestion window) HTTP/2 multiplexes requests onto (default: false, i.e. HTTP/2 is negotiated when the upstream supports it)
 				"maxIdleConnsPerHost": 30,           # per-host idle connection pool size (default: 2; when disableHTTP2 is true and this is unset, defaults to reqConcurrent instead, so pooled HTTP/1.1 connections aren't closed under concurrency)
 				"onlySigned": true,                 # when true, tag sync requires a remote signature (notary/cosign/referrers). On-demand digest pulls skip that check so multi-arch tag→digest client flows work (signatures normally cover the index, not each platform child). A client that already knows an upstream digest can therefore sync that manifest without a per-manifest signature. Periodic child digests after a signed tag also skip re-checking.
+				"exclude": ["private/**"],          # local repos never synced from this registry, periodically or on demand; served from local storage only. Same glob syntax as content prefixes, matched against the local repo name. See "Sync's exclude option" below
 				"content":[                         # which content to periodically pull, also it's used for filtering ondemand images, if not set then periodically polling will not run
 					{
 						"prefix":"/repo1/repo",         # pull image repo1/repo
@@ -1563,6 +1581,33 @@ Configure each registry sync:
 		}
 ```
 Prefixes can be strings that exactly match repositories or they can be [glob](https://en.wikipedia.org/wiki/Glob_(programming)) patterns.
+
+### Sync's exclude option
+
+`content` lists the repositories to sync. `exclude` does the opposite: it lists repositories that are
+never synced from a registry, so they can be pushed to and pulled from zot like any repository that is
+not synced, for instance when the same zot is both a pull-through cache and the registry for your own
+images:
+
+```
+			"registries": [{
+				"urls": ["https://registry-1.docker.io"],
+				"onDemand": true,
+				"exclude": ["mycompany/**", "internal/app"]
+			}]
+```
+
+Requests for `mycompany/...` and `internal/app` are then served from local storage only, and a
+reference that is not stored locally returns `404` without contacting upstream. Every other
+repository is still synced on demand. Notes:
+
+ - entries are [glob](https://en.wikipedia.org/wiki/Glob_(programming)) patterns, like content
+   prefixes; `mycompany/**` matches `mycompany` and every repository under it
+ - they are matched against the local repository name, after `destination` and `stripPrefix` are
+   applied, and win over `content`: a repository that matches both is not synced
+ - they apply to periodic and on-demand sync, including `stream` and `onDemandInBackground`
+ - they apply to the registry they are set on; with several registries, set them on each registry
+   a repository must not be synced from
 
 ### Sync's manifestCheckInterval option
 
@@ -1702,3 +1747,31 @@ Scan results are cached by manifest digest. Editing an ignore file does not inva
 `scanRemovedPkgs` mirrors Trivy's `--removed-pkgs` and reports vulnerabilities for packages deleted in later image layers. `includeDevDeps` mirrors Trivy's `--include-dev-deps` and reports development dependencies. Both default to `false`.
 
 `sbom.enable` lets zot generate SBOMs while scanning and store them as OCI artifacts attached to the scanned image. `sbom.format` supports `spdx-json` (default) and `cyclonedx`.
+
+## Lint
+
+The `lint` extension rejects image manifests that are missing any of the `mandatoryAnnotations`. An annotation is also accepted when it is set as a label in the image config. See [config-lint.json](config-lint.json).
+
+Images that the [sync](#sync) extension copies from an upstream registry are linted too, so third-party images that lack the annotations cannot be mirrored. Set `skipSyncedImages` to `true` to lint only the images that clients push:
+
+```json
+"extensions": {
+  "lint": {
+    "enable": true,
+    "mandatoryAnnotations": ["org.opencontainers.image.title", "org.opencontainers.image.description"],
+    "skipSyncedImages": true
+  },
+  "sync": {
+    "enable": true,
+    "registries": [
+      {
+        "urls": ["https://registry-1.docker.io"],
+        "onDemand": true,
+        "content": [{ "prefix": "**" }]
+      }
+    ]
+  }
+}
+```
+
+`skipSyncedImages` defaults to `false`.

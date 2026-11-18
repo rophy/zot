@@ -4559,6 +4559,39 @@ func TestSyncPlatformsConfig(t *testing.T) {
 	})
 }
 
+func TestSyncExcludeConfig(t *testing.T) {
+	Convey("exclude validation", t, func() {
+		Convey("Accept valid exclude patterns", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "content": [{"prefix": "**"}],
+				"exclude": ["private/**", "/internal/app"]}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldBeNil)
+			So(cfg.Extensions.Sync.Registries[0].Exclude, ShouldResemble,
+				[]string{"private/**", "/internal/app"})
+		})
+
+		Convey("Reject an exclude pattern that does not compile", func() {
+			content := `{"storage":{"rootDirectory":"/tmp/zot"},
+				"http":{"address":"127.0.0.1","port":"8080","realm":"zot",
+				"auth":{"htpasswd":{"path":"test/data/htpasswd"},"failDelay":1}},
+				"extensions":{"sync": {"registries": [{"urls":["localhost:9999"],
+				"onDemand": true, "exclude": ["private/**", "[repo%^&"]}]}}}`
+			cfg := config.New()
+			tmpfile := MakeTempFileWithContent(t, "zot-test.json", content)
+			err := cli.LoadConfiguration(cfg, tmpfile)
+			So(err, ShouldNotBeNil)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+			So(err.Error(), ShouldContainSubstring, "sync exclude pattern could not be compiled")
+		})
+	})
+}
+
 func TestStreamingSyncConfig(t *testing.T) {
 	Convey("stream validation", t, func() {
 		validRegistry := `{"urls":["https://localhost:9999"], "onDemand": true, "stream": true}`
@@ -4723,6 +4756,41 @@ func TestStreamingSyncConfig(t *testing.T) {
 				` "content": [{"prefix": "b/**"}]}`
 
 			err := loadWithRegistry(t, regA+","+regB)
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
+func TestAPIKeyMaxLifetimeConfig(t *testing.T) {
+	Convey("Test apikeyMaxLifetime config", t, func() {
+		makeConfig := func(auth string) string {
+			return `{"distSpecVersion": "1.1.1", "storage": {"rootDirectory": "/tmp/zot"},
+			"http": {"address": "127.0.0.1", "port": "8080", "auth": ` + auth + `},
+			"log": {"level": "debug"}}`
+		}
+
+		Convey("Duration string", func() {
+			conf := config.New()
+			file := MakeTempFileWithContent(t, "apikey-max-lifetime.json",
+				makeConfig(`{"apikey": true, "apikeyMaxLifetime": "720h"}`))
+			err := cli.LoadConfiguration(conf, file)
+			So(err, ShouldBeNil)
+			So(conf.HTTP.Auth.APIKeyMaxLifetime, ShouldEqual, 720*time.Hour)
+		})
+
+		Convey("Negative", func() {
+			conf := config.New()
+			file := MakeTempFileWithContent(t, "apikey-max-lifetime.json",
+				makeConfig(`{"apikey": true, "apikeyMaxLifetime": "-1h"}`))
+			err := cli.LoadConfiguration(conf, file)
+			So(err, ShouldWrap, zerr.ErrBadConfig)
+		})
+
+		Convey("Without apikey: ignored, not an error", func() {
+			conf := config.New()
+			file := MakeTempFileWithContent(t, "apikey-max-lifetime.json",
+				makeConfig(`{"apikeyMaxLifetime": "1h"}`))
+			err := cli.LoadConfiguration(conf, file)
 			So(err, ShouldBeNil)
 		})
 	})

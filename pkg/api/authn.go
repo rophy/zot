@@ -286,6 +286,26 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 	return false, nil
 }
 
+// apiKeyExceedsMaxLifetime reports whether the key is older than apikeyMaxLifetime.
+// This also covers keys created before the cap was set, or with a longer one.
+// The stored key is not changed, so raising or removing the cap restores it.
+func apiKeyExceedsMaxLifetime(ctlr *Controller, request *http.Request, hashedKey string) (bool, error) {
+	authConfig := ctlr.Config.CopyAuthConfig()
+	if authConfig == nil || authConfig.APIKeyMaxLifetime <= 0 {
+		return false, nil
+	}
+
+	userData, err := ctlr.MetaDB.GetUserData(request.Context())
+	if err != nil {
+		return false, err
+	}
+
+	// A missing key or creation time gives a zero CreatedAt, which is past any cap.
+	createdAt := userData.APIKeys[hashedKey].CreatedAt
+
+	return time.Now().After(createdAt.Add(authConfig.APIKeyMaxLifetime)), nil
+}
+
 func authenticateAPIKeyCredential(ctlr *Controller, userAc *reqCtx.UserAccessControl, request *http.Request,
 	identity, apiKey string,
 ) (bool, error) {
@@ -336,6 +356,19 @@ func authenticateAPIKeyCredential(ctlr *Controller, userAc *reqCtx.UserAccessCon
 		return false, nil
 	}
 
+	exceeded, err := apiKeyExceedsMaxLifetime(ctlr, request, hashedKey)
+	if err != nil {
+		ctlr.Log.Err(err).Str("identity", identity).Msg("failed to verify api key max lifetime")
+
+		return false, err
+	}
+
+	if exceeded {
+		ctlr.Log.Info().Str("identity", identity).Msg("api key is older than apikeyMaxLifetime")
+
+		return false, nil
+	}
+
 	err = ctlr.MetaDB.UpdateUserAPIKeyLastUsed(request.Context(), hashedKey)
 	if err != nil {
 		ctlr.Log.Err(err).Str("identity", identity).Msg("failed to update user profile in DB")
@@ -351,6 +384,7 @@ func authenticateAPIKeyCredential(ctlr *Controller, userAc *reqCtx.UserAccessCon
 	}
 
 	userAc.AddGroups(groups)
+	userAc.SetAPIKeyAuthenticated()
 	userAc.SaveOnRequest(request)
 
 	return true, nil
@@ -1065,8 +1099,8 @@ func authFail(w http.ResponseWriter, r *http.Request, realm string, delay int) {
 		time.Sleep(time.Duration(delay) * time.Second)
 	}
 
-	// don't send auth headers if request is coming from UI
-	if !hasSessionHeader(r) {
+	// don't send auth headers if request is coming from UI (see suppressBasicAuthChallenge)
+	if !suppressBasicAuthChallenge(r) {
 		setBasicAuthChallenge(w, realm)
 	}
 
@@ -1139,6 +1173,19 @@ func hasSessionHeader(request *http.Request) bool {
 	clientHeader := request.Header.Get(constants.SessionClientHeaderName)
 
 	return clientHeader == constants.SessionClientHeaderValue
+}
+
+// suppressBasicAuthChallenge reports whether a 401 should omit "WWW-Authenticate: Basic".
+// Only the zot UI (X-ZOT-API-CLIENT: zot-ui) is exempt: it has its own login form, and a
+// challenge would make the browser show its native prompt and cache credentials that take
+// precedence over the session cookie (issue #4699). Every other client keeps the challenge,
+// including browsers opening the GraphQL playground, Swagger UI or a /v2/ URL directly:
+// they do not send the UI header, so their session cookie is ignored and the native prompt
+// is their only way to authenticate. Credentials cached that way are cleared by the UI
+// logout's Clear-Site-Data on HTTPS. Authentication is still enforced either way; only the
+// challenge is dropped. pkg/common's authz failure writers apply the same UI-only rule.
+func suppressBasicAuthChallenge(request *http.Request) bool {
+	return hasSessionHeader(request)
 }
 
 func getUsernamePasswordBasicAuth(request *http.Request) (string, string, error) {

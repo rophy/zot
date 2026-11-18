@@ -798,6 +798,10 @@ func validateConfiguration(config *config.Config, logger zlog.Logger) error {
 		return err
 	}
 
+	if err := validateAPIKeyMaxLifetime(config, logger); err != nil {
+		return err
+	}
+
 	if err := validateLDAP(config, logger); err != nil {
 		return err
 	}
@@ -1696,6 +1700,28 @@ func validateHTTP(config *config.Config, logger zlog.Logger) error {
 	return nil
 }
 
+func validateAPIKeyMaxLifetime(config *config.Config, logger zlog.Logger) error {
+	authConfig := config.CopyAuthConfig()
+	if authConfig == nil || authConfig.APIKeyMaxLifetime == 0 {
+		return nil
+	}
+
+	if authConfig.APIKeyMaxLifetime < 0 {
+		logger.Error().Err(zerr.ErrBadConfig).Dur("apikeyMaxLifetime", authConfig.APIKeyMaxLifetime).
+			Msg("invalid api key max lifetime, must be positive")
+
+		return fmt.Errorf("%w: invalid api key max lifetime %s, must be positive",
+			zerr.ErrBadConfig, authConfig.APIKeyMaxLifetime)
+	}
+
+	if !authConfig.IsAPIKeyEnabled() {
+		logger.Warn().Err(zerr.ErrBadConfig).
+			Msg("api key max lifetime specified without enabling api keys, will be ignored")
+	}
+
+	return nil
+}
+
 func validateGC(config *config.Config, logger zlog.Logger) error {
 	// enforce GC params
 	storageConfig := config.CopyStorageConfig()
@@ -2028,7 +2054,26 @@ func validateSyncRegistry(config *config.Config, regID int, regCfg syncconf.Regi
 		}
 	}
 
+	if err := validateSyncExclude(regCfg, logger); err != nil {
+		return err
+	}
+
 	return validateSyncContent(config, regCfg, logger)
+}
+
+// validateSyncExclude checks the exclude patterns compile, so that a typo can't silently let an
+// excluded repository be synced.
+func validateSyncExclude(regCfg syncconf.RegistryConfig, logger zlog.Logger) error {
+	for _, pattern := range regCfg.Exclude {
+		if ok := glob.ValidatePattern(pattern); !ok {
+			msg := "sync exclude pattern could not be compiled"
+			logger.Error().Err(glob.ErrBadPattern).Str("pattern", pattern).Msg(msg)
+
+			return fmt.Errorf("%w: %s: %s", zerr.ErrBadConfig, msg, pattern)
+		}
+	}
+
+	return nil
 }
 
 // invalidOptionalPositiveFloat reports whether an optional float setting is set to a value that is

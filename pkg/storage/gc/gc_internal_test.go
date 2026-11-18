@@ -23,6 +23,7 @@ import (
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
+	"zotregistry.dev/zot/v2/pkg/cluster"
 	zcommon "zotregistry.dev/zot/v2/pkg/common"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
 	zlog "zotregistry.dev/zot/v2/pkg/log"
@@ -3187,6 +3188,163 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 	})
 }
 
+func TestCleanRepoDefersMetaDBPruningUntilIndexCommit(t *testing.T) {
+	Convey("cleanRepo commits the index before applying its MetaDB pruning plan", t, func() {
+		const repo = "gc-meta-plan"
+		const tag = "drop"
+
+		digest := godigest.FromString("gc-meta-plan-manifest")
+		index := ispec.Index{
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageIndex,
+			Manifests: []ispec.Descriptor{{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    digest,
+				Annotations: map[string]string{
+					ispec.AnnotationRefName: tag,
+				},
+			}},
+		}
+
+		indexBuf, err := json.Marshal(index)
+		So(err, ShouldBeNil)
+
+		manifestBuf, err := json.Marshal(ispec.Manifest{
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
+		})
+		So(err, ShouldBeNil)
+
+		falseVal := false
+		gcOptions := Options{
+			Delay: time.Hour,
+			ImageRetention: config.ImageRetention{
+				Delay: time.Hour,
+				Policies: []config.RetentionPolicy{{
+					Repositories:   []string{"**"},
+					DeleteUntagged: &falseVal,
+					KeepTags: []config.KeepTagsPolicy{{
+						Patterns: []string{"^keep$"},
+					}},
+				}},
+			},
+		}
+
+		runGC := func(putErr error) (bool, bool, ispec.Index, ispec.Index, int, error) {
+			metaDeleted := false
+			putSawMetaDeletion := false
+			writtenIndex := ispec.Index{}
+			persistedIndex := index
+			putCalls := 0
+
+			imgStore := mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return indexBuf, nil
+				},
+				GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+					return manifestBuf, nil
+				},
+				GetAllBlobsFn: func(repo string) ([]godigest.Digest, error) {
+					return []godigest.Digest{digest}, nil
+				},
+				PutIndexContentFn: func(repo string, updatedIndex ispec.Index) error {
+					putCalls++
+					putSawMetaDeletion = metaDeleted
+					if putCalls == 1 {
+						writtenIndex = updatedIndex
+					}
+					persistedIndex = updatedIndex
+
+					if putErr != nil && putCalls == 1 {
+						return putErr
+					}
+
+					return nil
+				},
+			}
+
+			metaDB := mocks.MetaDBMock{
+				GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
+					return types.RepoMeta{
+						Name: repo,
+						Tags: map[types.Tag]types.Descriptor{
+							tag: {Digest: digest.String(), MediaType: ispec.MediaTypeImageManifest},
+						},
+						Statistics: map[types.ImageDigest]types.DescriptorStatistics{
+							digest.String(): {},
+						},
+					}, nil
+				},
+				RemoveRepoReferenceFn: func(repo, reference string, manifestDigest godigest.Digest) error {
+					metaDeleted = true
+
+					return nil
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, metaDB, gcOptions, zlog.NewAuditLogger("debug", ""),
+				zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+			return metaDeleted, putSawMetaDeletion, writtenIndex, persistedIndex, putCalls,
+				gc.cleanRepo(context.Background(), repo)
+		}
+
+		Convey("keeps MetaDB unchanged when PutIndexContent fails", func() {
+			metaDeleted, putSawMetaDeletion, writtenIndex, persistedIndex, putCalls, err := runGC(errGC)
+
+			So(errors.Is(err, errGC), ShouldBeTrue)
+			So(metaDeleted, ShouldBeFalse)
+			So(putSawMetaDeletion, ShouldBeFalse)
+			So(putCalls, ShouldEqual, 2)
+			So(writtenIndex.Manifests, ShouldHaveLength, 1)
+			_, hasTag := writtenIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeFalse)
+			So(persistedIndex.Manifests, ShouldHaveLength, 1)
+			_, hasTag = persistedIndex.Manifests[0].Annotations[ispec.AnnotationRefName]
+			So(hasTag, ShouldBeTrue)
+		})
+
+		Convey("applies MetaDB pruning after a successful index commit", func() {
+			metaDeleted, putSawMetaDeletion, _, _, putCalls, err := runGC(nil)
+
+			So(err, ShouldBeNil)
+			So(metaDeleted, ShouldBeTrue)
+			So(putSawMetaDeletion, ShouldBeFalse)
+			So(putCalls, ShouldEqual, 1)
+		})
+	})
+}
+
+func TestCommitMetaDBPlanStopsAfterError(t *testing.T) {
+	Convey("commitMetaDBPlan stops after the first strict metadata error", t, func() {
+		firstCalled := false
+		secondCalled := false
+
+		gc := GarbageCollect{
+			metaPlan: &gcMetaDBPlan{
+				operations: []func() error{
+					func() error {
+						firstCalled = true
+
+						return errGC
+					},
+					func() error {
+						secondCalled = true
+
+						return nil
+					},
+				},
+			},
+		}
+
+		err := gc.commitMetaDBPlan()
+
+		So(errors.Is(err, errGC), ShouldBeTrue)
+		So(firstCalled, ShouldBeTrue)
+		So(secondCalled, ShouldBeFalse)
+	})
+}
+
 func TestCleanRepoWithStaleManifestEntries(t *testing.T) {
 	ctx := context.Background()
 
@@ -3492,6 +3650,19 @@ func TestGCTaskGeneratorTimeWindow(t *testing.T) {
 				processedRepos: map[string]struct{}{"repo1": {}},
 				nextRun:        now.Add(-time.Second),
 			}
+			So(gen.IsReady(), ShouldBeTrue)
+		})
+
+		Convey("a new sweep waits until the tasks of the last sweep are done", func() {
+			gen := &GCTaskGenerator{}
+
+			// the last sweep handed out its tasks, one of them hasn't run yet
+			gen.sweep.start()
+			gen.sweep.taskStarted()
+			gen.sweep.generationDone()
+			So(gen.IsReady(), ShouldBeFalse)
+
+			gen.sweep.taskDone(nil)
 			So(gen.IsReady(), ShouldBeTrue)
 		})
 
@@ -4397,4 +4568,86 @@ func TestGCTaskGeneratorStorageErrClasses(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestGCTaskGeneratorClusterOwnership(t *testing.T) {
+	Convey("A GC sweep in a scale-out cluster only visits the repos the local member owns", t, func() {
+		members := []string{"127.0.0.1:9000", "127.0.0.2:9000"}
+		hashKey := "loremipsumdolors"
+		repos := []string{"alpine", "busybox", "debian", "fedora", "ubuntu", "zot/test"}
+
+		imgStore := local.NewImageStore(t.TempDir(), false, false, zlog.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+
+		ownedBy := map[uint64][]string{}
+
+		for _, repo := range repos {
+			So(WriteImageToFileSystem(CreateRandomImage(), repo, "v1", storeController), ShouldBeNil)
+
+			targetIdx, _ := cluster.ComputeTargetMember(hashKey, members, repo)
+			ownedBy[targetIdx] = append(ownedBy[targetIdx], repo)
+		}
+
+		// the test relies on each member owning some of the repos
+		So(ownedBy[0], ShouldNotBeEmpty)
+		So(ownedBy[1], ShouldNotBeEmpty)
+
+		sweep := func(clusterConfig *config.ClusterConfig) map[string]int {
+			gcInstance := NewGarbageCollect(imgStore, nil, Options{
+				Delay:          time.Hour,
+				ImageRetention: config.ImageRetention{Delay: time.Hour},
+				Cluster:        clusterConfig,
+			}, zlog.NewAuditLogger("debug", "/dev/null"), zlog.NewTestLogger(), monitoring.NewNopMetricServer())
+
+			gen := &GCTaskGenerator{
+				imgStore:       imgStore,
+				gc:             gcInstance,
+				processedRepos: map[string]struct{}{},
+				maxDelay:       time.Millisecond,
+			}
+
+			visited := map[string]int{}
+			So(runGCGenerator(context.Background(), gen, visited), ShouldBeNil)
+			So(gen.IsDone(), ShouldBeTrue)
+
+			return visited
+		}
+
+		for _, localIdx := range []uint64{0, 1} {
+			visited := sweep(&config.ClusterConfig{
+				Members: members,
+				HashKey: hashKey,
+				Proxy:   &config.ClusterRequestProxyConfig{LocalMemberClusterSocketIndex: localIdx},
+			})
+
+			So(visited, ShouldHaveLength, len(ownedBy[localIdx]))
+
+			for _, repo := range ownedBy[localIdx] {
+				So(visited[repo], ShouldEqual, 1)
+			}
+		}
+
+		Convey("and visits every repo when it is not part of a cluster", func() {
+			for _, clusterConfig := range []*config.ClusterConfig{
+				nil,
+				// a single member owns every repo
+				{
+					Members: members[:1],
+					HashKey: hashKey,
+					Proxy:   &config.ClusterRequestProxyConfig{LocalMemberClusterSocketIndex: 0},
+				},
+				// no local member index outside of a running controller, e.g. verify-feature retention
+				{Members: members, HashKey: hashKey},
+			} {
+				visited := sweep(clusterConfig)
+
+				So(visited, ShouldHaveLength, len(repos))
+
+				for _, repo := range repos {
+					So(visited[repo], ShouldEqual, 1)
+				}
+			}
+		})
+	})
 }

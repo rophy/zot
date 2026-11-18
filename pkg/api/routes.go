@@ -226,7 +226,7 @@ func (rh *RouteHandler) SetupRoutes() {
 	ext.SetupSearchRoutes(rh.c.Config, prefixedRouter, rh.c.StoreController, rh.c.MetaDB, rh.c.CveScanner,
 		rh.c.Log)
 	ext.SetupImageTrustRoutes(rh.c.Config, prefixedRouter, rh.c.MetaDB, rh.c.Log)
-	ext.SetupMgmtRoutes(rh.c.Config, prefixedRouter, rh.c.Log)
+	ext.SetupMgmtRoutes(rh.c.Config, prefixedRouter, rh.c.GCOnDemand, rh.c.Log)
 	ext.SetupUserPreferencesRoutes(rh.c.Config, prefixedRouter, rh.c.MetaDB, rh.c.Log)
 	setupQuotaMiddleware(rh.c.Config, prefixedDistSpecRouter, rh.c.MetaDB, rh.c.Log)
 	// last should always be UI because it will setup a http.FileServer and paths will be resolved by this FileServer.
@@ -1079,7 +1079,8 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 	ctx := events.WithEventContext(request.Context(), eventContextFromRequest(request))
 
 	err = imgStore.DeleteImageManifest(ctx, name, reference, detectCollision)
-	if err != nil { //nolint: dupl
+	cleanupCommitted := errors.Is(err, zerr.ErrManifestBlobCleanup)
+	if err != nil && !cleanupCommitted { //nolint: dupl
 		details := zerr.GetDetails(err)
 		if writeStorageClassError(response, err) {
 			rh.c.Log.Error().Err(err).Msg("failed to delete manifest due to storage failure")
@@ -1114,6 +1115,10 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 		}
 
 		return
+	}
+	if cleanupCommitted {
+		rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", reference).
+			Msg("manifest deleted logically; blob cleanup deferred to garbage collection")
 	}
 
 	if rh.c.MetaDB != nil {
@@ -2153,6 +2158,8 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 		// CheckBlob looks for the digest under dest first, then the dedupe cache; on a
 		// cache hit it hard-links into dest. On failure (or if canMount denied), fall
 		// through to a new blob upload.
+		// Mount requests carry only the digest (no Content-Length); skip blob-byte
+		// quota here and rely on the manifest gate.
 		if userCanMount {
 			_, _, err = imgStore.CheckBlob(ctx, name, mountDigest)
 		}
@@ -2199,93 +2206,8 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 	}
 
 	// a full blob upload if "digest" is present
-	digests, ok := request.URL.Query()["digest"]
-	if ok {
-		if len(digests) != 1 {
-			response.WriteHeader(http.StatusBadRequest)
-
-			return
-		}
-
-		if contentType := request.Header.Get("Content-Type"); contentType != constants.BinaryMediaType {
-			rh.c.Log.Warn().Str("actual", contentType).Str("expected", constants.BinaryMediaType).Msg("invalid media type")
-			response.WriteHeader(http.StatusUnsupportedMediaType)
-
-			return
-		}
-
-		digestStr := digests[0]
-
-		digest, err := godigest.Parse(digestStr)
-		if err != nil {
-			e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(map[string]string{"digest": digestStr})
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-
-			return
-		}
-
-		if digestAlgorithm != "" && digestAlgorithm != digest.Algorithm() {
-			e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(map[string]string{
-				"digest":           digest.String(),
-				"digest-algorithm": digestAlgorithm.String(),
-			})
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-
-			return
-		}
-
-		var contentLength int64
-
-		// request.ContentLength is pre-parsed by net/http: 0 for an explicit empty
-		// body, -1 when unknown/chunked. Reject only the unknown case (< 0); a
-		// Content-Length of 0 is a valid empty-blob upload.
-		contentLength = request.ContentLength
-		if contentLength < 0 {
-			rh.c.Log.Warn().Int64("actual", contentLength).Msg("invalid content length")
-
-			details := map[string]string{
-				"digest":         digest.String(),
-				"Content-Length": strconv.FormatInt(contentLength, 10),
-			}
-
-			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-
-			return
-		}
-
-		sessionID, size, err := imgStore.FullBlobUpload(ctx, name, request.Body, digest)
-		if err != nil {
-			if errors.Is(err, zerr.ErrBadBlobDigest) {
-				details := zerr.GetDetails(err)
-				details["digest"] = digest.String()
-				e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(details)
-				zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
-
-				return
-			}
-
-			rh.c.Log.Error().Err(err).Int64("actual", size).Int64("expected", contentLength).
-				Msg("failed to full blob upload")
-			if writeStorageClassError(response, err) {
-				return
-			}
-
-			response.WriteHeader(http.StatusInternalServerError)
-
-			return
-		}
-
-		if size != contentLength {
-			rh.c.Log.Warn().Int64("actual", size).Int64("expected", contentLength).Msg("invalid content length")
-			response.WriteHeader(http.StatusInternalServerError)
-
-			return
-		}
-
-		response.Header().Set("Location", getBlobUploadLocation(request.URL, name, digest))
-		response.Header().Set(constants.BlobUploadUUID, sessionID)
-		response.WriteHeader(http.StatusCreated)
+	if digests, ok := request.URL.Query()["digest"]; ok {
+		rh.createFullBlobUpload(ctx, response, request, imgStore, name, digests, digestAlgorithm)
 
 		return
 	}
@@ -2314,6 +2236,99 @@ func (rh *RouteHandler) CreateBlobUpload(response http.ResponseWriter, request *
 	response.Header().Set("Location", getBlobUploadSessionLocation(request.URL, upload))
 	response.Header().Set("Range", "0-0")
 	response.WriteHeader(http.StatusAccepted)
+}
+
+// createFullBlobUpload handles POST .../blobs/uploads/?digest=... monolithic uploads.
+func (rh *RouteHandler) createFullBlobUpload(ctx context.Context, response http.ResponseWriter, request *http.Request,
+	imgStore storageTypes.ImageStore, name string, digests []string, digestAlgorithm godigest.Algorithm,
+) {
+	if len(digests) != 1 {
+		response.WriteHeader(http.StatusBadRequest)
+
+		return
+	}
+
+	if contentType := request.Header.Get("Content-Type"); contentType != constants.BinaryMediaType {
+		rh.c.Log.Warn().Str("actual", contentType).Str("expected", constants.BinaryMediaType).Msg("invalid media type")
+		response.WriteHeader(http.StatusUnsupportedMediaType)
+
+		return
+	}
+
+	digestStr := digests[0]
+
+	digest, err := godigest.Parse(digestStr)
+	if err != nil {
+		e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(map[string]string{"digest": digestStr})
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+
+		return
+	}
+
+	if digestAlgorithm != "" && digestAlgorithm != digest.Algorithm() {
+		e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(map[string]string{
+			"digest":           digest.String(),
+			"digest-algorithm": digestAlgorithm.String(),
+		})
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+
+		return
+	}
+
+	// request.ContentLength is pre-parsed by net/http: 0 for an explicit empty
+	// body, -1 when unknown/chunked. Reject only the unknown case (< 0); a
+	// Content-Length of 0 is a valid empty-blob upload.
+	contentLength := request.ContentLength
+	if contentLength < 0 {
+		rh.c.Log.Warn().Int64("actual", contentLength).Msg("invalid content length")
+
+		details := map[string]string{
+			"digest":         digest.String(),
+			"Content-Length": strconv.FormatInt(contentLength, 10),
+		}
+
+		e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+
+		return
+	}
+
+	if rejected, _ := rh.checkRepoBlobQuota(response, request, name, digest, contentLength); rejected {
+		return
+	}
+
+	sessionID, size, err := imgStore.FullBlobUpload(ctx, name, request.Body, digest)
+	if err != nil {
+		if errors.Is(err, zerr.ErrBadBlobDigest) {
+			details := zerr.GetDetails(err)
+			details["digest"] = digest.String()
+			e := apiErr.NewError(apiErr.DIGEST_INVALID).AddDetail(details)
+			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+
+			return
+		}
+
+		rh.c.Log.Error().Err(err).Int64("actual", size).Int64("expected", contentLength).
+			Msg("failed to full blob upload")
+		if writeStorageClassError(response, err) {
+			return
+		}
+
+		response.WriteHeader(http.StatusInternalServerError)
+
+		return
+	}
+
+	if size != contentLength {
+		rh.c.Log.Warn().Int64("actual", size).Int64("expected", contentLength).Msg("invalid content length")
+		response.WriteHeader(http.StatusInternalServerError)
+
+		return
+	}
+
+	response.Header().Set("Location", getBlobUploadLocation(request.URL, name, digest))
+	response.Header().Set(constants.BlobUploadUUID, sessionID)
+	response.WriteHeader(http.StatusCreated)
 }
 
 // parseDigestAlgorithmQuery returns the optional digest-algorithm query value.
@@ -2588,6 +2603,14 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 
 	var from, to int64
 
+	// Blob quota size comes only from this request's headers (no GetBlobUpload).
+	// Monolithic: Content-Length. Chunked: inclusive Content-Range end + 1.
+	// Finish with neither header (empty complete-after-PATCH): skip blob quota; manifest gate remains.
+	var (
+		blobQuotaSize     int64
+		haveBlobQuotaSize bool
+	)
+
 	if shouldPutBlobChunk {
 		contentLen, err := strconv.ParseInt(contentLenHeader, 10, 64)
 		if err != nil || contentLen < 0 {
@@ -2611,9 +2634,12 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 
 			if contentLen > 0 {
 				to = contentLen
+				blobQuotaSize = contentLen
+				haveBlobQuotaSize = true
 			} else {
-				// Zero-length monolithic upload (e.g. empty blob): skip
-				// PutBlobChunk and go straight to FinishBlobUpload below.
+				// Content-Length 0 is used both for empty blobs and for
+				// complete-after-PATCH (no body). Total size is not in this
+				// request; skip blob quota and rely on the manifest gate.
 				shouldPutBlobChunk = false
 			}
 		} else if from, to, err = getContentRange(request); err != nil || (to-from)+1 != contentLen { // finish chunked upload
@@ -2621,6 +2647,25 @@ func (rh *RouteHandler) UpdateBlobUpload(response http.ResponseWriter, request *
 			details["session_id"] = sessionID
 			e := apiErr.NewError(apiErr.BLOB_UPLOAD_INVALID).AddDetail(details)
 			zcommon.WriteJSON(response, http.StatusRequestedRangeNotSatisfiable, apiErr.NewErrorList(e))
+
+			return
+		} else {
+			blobQuotaSize = to + 1
+			haveBlobQuotaSize = true
+		}
+	}
+
+	// Gate before PutBlobChunk so MetaDB/503 leaves the session at the same
+	// offset and the client can retry the same Content-Range.
+	if haveBlobQuotaSize {
+		rejected, deleteUpload := rh.checkRepoBlobQuota(response, request, name, digest, blobQuotaSize)
+		if rejected {
+			if deleteUpload {
+				if delErr := imgStore.DeleteBlobUpload(name, sessionID); delErr != nil {
+					rh.c.Log.Error().Err(delErr).Str("blobUpload", sessionID).Str("repository", name).
+						Msg("failed to remove blobUpload after quota reject")
+				}
+			}
 
 			return
 		}
@@ -2973,9 +3018,66 @@ func (rh *RouteHandler) Logout(response http.ResponseWriter, request *http.Reque
 		return
 	}
 
+	// Basic auth has no logout of its own: browsers keep re-sending cached credentials,
+	// which would re-authenticate the previous user right after the session is expired.
+	// Per the Clear-Site-Data spec the "cookies" directive also clears cached HTTP auth
+	// credentials. Browsers honor it only in secure contexts (HTTPS), and it clears
+	// cookies for the whole registrable domain. Set only after the session was expired
+	// successfully, so a failed logout does not clear unrelated site data, and only for
+	// requests from a trusted origin (see isTrustedLogoutOrigin).
+	if rh.isTrustedLogoutOrigin(request) {
+		response.Header().Set("Clear-Site-Data", `"cookies"`)
+	}
+
+	// Keep the logout response out of any cache so the headers above always reach the browser.
+	// Set whether or not the origin is trusted: it does not wipe anything, so it needs no gate.
+	response.Header().Set("Cache-Control", "no-store")
+
 	zcommon.WriteJSON(response, http.StatusOK, LogoutResponse{
 		EndSessionURL: rh.buildEndSessionURL(provider),
 	})
+}
+
+// isTrustedLogoutOrigin reports whether a logout request may trigger Clear-Site-Data.
+// The logout endpoint needs no credentials, and CORS does not stop cross-site form
+// POSTs, so without this check any site could wipe cookies for zot and every sibling
+// application on the registrable domain. Clear-Site-Data only works in secure contexts,
+// where browsers always send Sec-Fetch-Site, so requiring it loses no legitimate case.
+// A UI served from another origin is trusted when its scheme, host and port match an
+// http.allowOrigin entry or http.externalUrl; the wildcard "*" is never trusted here.
+// The session itself is expired regardless; this only gates the domain-wide data wipe.
+func (rh *RouteHandler) isTrustedLogoutOrigin(request *http.Request) bool {
+	switch request.Header.Get("Sec-Fetch-Site") {
+	case "same-origin":
+		return true
+	case "same-site", "cross-site":
+		// Cross-origin UI deployments; checked against the configured origins below.
+	default:
+		// Missing (non-browser or insecure context) or "none" (user-initiated, which a
+		// POST cannot be): Clear-Site-Data would be ignored or is not wanted.
+		return false
+	}
+
+	// Canonicalize both sides (lowercase, explicit default port) so that e.g. an externalUrl of
+	// https://ui.example.com:443/zot matches Origin: https://ui.example.com. "null", "*", empty
+	// and malformed values fail to canonicalize and are never trusted.
+	requestOrigin, ok := canonicalOriginString(request.Header.Get("Origin"))
+	if !ok {
+		return false
+	}
+
+	trusted := strings.Split(rh.c.Config.GetAllowOrigin(), ",")
+	if rh.c.Config.HTTP.ExternalURL != "" {
+		trusted = append(trusted, rh.c.Config.HTTP.ExternalURL)
+	}
+
+	for _, candidate := range trusted {
+		if candidateOrigin, ok := canonicalOriginString(candidate); ok && candidateOrigin == requestOrigin {
+			return true
+		}
+	}
+
+	return false
 }
 
 // buildEndSessionURL returns the OIDC provider's RP-Initiated Logout URL for the given
@@ -3494,17 +3596,36 @@ func (rh *RouteHandler) GetAPIKeys(resp http.ResponseWriter, req *http.Request) 
 // CreateAPIKey godoc
 // @Summary Create an API key for the current user
 // @Description Can create an api key for a logged in user, based on the provided label and scopes.
+// @Description If apikeyMaxLifetime is set, a longer or missing expiration date is set to now + apikeyMaxLifetime.
 // @Accept  json
 // @Produce json
 // @Param   id  body  APIKeyPayload  true  "api token id (UUID)"
 // @Success 201 {string} string "created"
 // @Failure 400 {string} string "bad request"
 // @Failure 401 {string} string "unauthorized"
+// @Failure 403 {string} string "forbidden"
 // @Failure 413 {string} string "request entity too large"
 // @Failure 500 {string} string "internal server error"
 // @Router  /zot/auth/apikey  [post].
 func (rh *RouteHandler) CreateAPIKey(resp http.ResponseWriter, req *http.Request) {
 	var payload APIKeyPayload
+
+	// An API key must not create API keys. Otherwise a key outlives its own expiry
+	// by creating a replacement, and can create keys that never expire.
+	userAc, err := reqCtx.UserAcFromContext(req.Context())
+	if err != nil {
+		resp.WriteHeader(http.StatusInternalServerError)
+
+		return
+	}
+
+	if userAc != nil && userAc.IsAPIKeyAuthenticated() {
+		rh.c.Log.Info().Str("identity", userAc.GetUsername()).
+			Msg("refusing to create an api key with api key authentication")
+		resp.WriteHeader(http.StatusForbidden)
+
+		return
+	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(resp, req.Body, constants.MaxAPIKeyBodySize))
 	if err != nil {
@@ -3552,6 +3673,20 @@ func (rh *RouteHandler) CreateAPIKey(resp http.ResponseWriter, req *http.Request
 			resp.WriteHeader(http.StatusBadRequest)
 
 			return
+		}
+	}
+
+	// Cap the lifetime. Clamp instead of reject, so clients that ask for no
+	// expiry, like the UI's default, still get a key.
+	if authConfig := rh.c.Config.CopyAuthConfig(); authConfig != nil && authConfig.APIKeyMaxLifetime > 0 {
+		maxExpirationDate := createdAt.Add(authConfig.APIKeyMaxLifetime)
+
+		if expirationDate.IsZero() || expirationDate.After(maxExpirationDate) {
+			rh.c.Log.Info().Str("requested", payload.ExpirationDate).
+				Str("expirationDate", maxExpirationDate.Format(constants.APIKeyTimeFormat)).
+				Msg("api key expiration date capped by apikeyMaxLifetime")
+
+			expirationDate = maxExpirationDate
 		}
 	}
 

@@ -264,8 +264,9 @@ func (bdw *BoltDB) SetRepoReference(ctx context.Context, repo string, reference 
 					taggedTimestamp = existingTag.GetTaggedTimestamp()
 				}
 				// else leave taggedTimestamp as nil (old data without TaggedTimestamp)
-			} else {
-				// New tag - set timestamp to now
+			} else if options.PushTimestamp.IsZero() {
+				// Live push records the current time. A re-parse sets PushTimestamp from the manifest
+				// blob mod time, shared by every tag of the digest, so leave TaggedTimestamp unset.
 				taggedTimestamp = timestamppb.Now()
 			}
 			protoRepoMeta.Tags[reference] = &proto_go.TagDescriptor{
@@ -849,6 +850,37 @@ func (bdw *BoltDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, re
 		}
 
 		return nil
+	})
+
+	return current, projected, err
+}
+
+func (bdw *BoltDB) GetRepoSizeWithBlobCandidate(ctx context.Context, repo string, digest godigest.Digest,
+	size int64,
+) (int64, int64, error) {
+	var current, projected int64
+
+	err := bdw.DB.View(func(transaction *bbolt.Tx) error {
+		repoMeta, metaErr := getProtoRepoMeta(repo, transaction.Bucket([]byte(RepoMetaBuck)))
+		if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+			return metaErr
+		}
+
+		currentSize := int64(0)
+		if metaErr == nil && repoMeta != nil {
+			currentSize = repoMeta.Size
+		}
+
+		repoBlobsBytes := transaction.Bucket([]byte(RepoBlobsBuck)).Get([]byte(repo))
+		repoBlobs, blobsErr := unmarshalProtoRepoBlobs(repo, repoBlobsBytes)
+		if blobsErr != nil {
+			return blobsErr
+		}
+
+		var projectErr error
+		current, projected, projectErr = common.ProjectRepoSizeWithBlob(currentSize, repoBlobs, digest, size)
+
+		return projectErr
 	})
 
 	return current, projected, err

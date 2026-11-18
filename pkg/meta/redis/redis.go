@@ -818,8 +818,9 @@ func (rc *RedisDB) SetRepoReference(ctx context.Context, repo string,
 					taggedTimestamp = existingTag.GetTaggedTimestamp()
 				}
 				// else leave taggedTimestamp as nil (old data without TaggedTimestamp)
-			} else {
-				// New tag - set timestamp to now
+			} else if options.PushTimestamp.IsZero() {
+				// Live push records the current time. A re-parse sets PushTimestamp from the manifest
+				// blob mod time, shared by every tag of the digest, so leave TaggedTimestamp unset.
 				taggedTimestamp = timestamppb.Now()
 			}
 			protoRepoMeta.Tags[reference] = &proto_go.TagDescriptor{
@@ -1238,6 +1239,31 @@ func (rc *RedisDB) GetRepoSizeWithCandidate(ctx context.Context, repo string, re
 	}
 
 	return current, projected, nil
+}
+
+func (rc *RedisDB) GetRepoSizeWithBlobCandidate(ctx context.Context, repo string, digest godigest.Digest,
+	size int64,
+) (int64, int64, error) {
+	protoRepoMeta, metaErr := rc.getProtoRepoMeta(ctx, repo)
+	currentSize := int64(0)
+	if metaErr != nil && !errors.Is(metaErr, zerr.ErrRepoMetaNotFound) {
+		return 0, 0, metaErr
+	}
+	if metaErr == nil && protoRepoMeta != nil {
+		currentSize = protoRepoMeta.Size
+	}
+
+	repoBlobsBytes, blobsErr := rc.Client.HGet(ctx, rc.RepoBlobsKey, repo).Bytes()
+	if blobsErr != nil && !errors.Is(blobsErr, redis.Nil) {
+		return 0, 0, blobsErr
+	}
+
+	repoBlobs, blobsErr := unmarshalProtoRepoBlobs(repo, repoBlobsBytes)
+	if blobsErr != nil {
+		return 0, 0, blobsErr
+	}
+
+	return common.ProjectRepoSizeWithBlob(currentSize, repoBlobs, digest, size)
 }
 
 // GetFullImageMeta returns the full information about an image.

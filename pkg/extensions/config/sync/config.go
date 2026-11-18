@@ -94,6 +94,10 @@ type RegistryConfig struct {
 	// the upstream negotiates h2, while DisableHTTP2 alone still caps concurrency at ReqConcurrent's
 	// default of 3 connections. To actually open more than 3 parallel connections to an HTTP/2
 	// upstream, raise ReqConcurrent and set DisableHTTP2.
+	//
+	// A streaming registry also opens a second client with the same limits (ReqConcurrent and
+	// ReqPerSec) for the blobs a downstream client is waiting on, so those don't queue behind the
+	// rest of the image. Its requests are counted separately from the first client's.
 	ReqConcurrent *int
 	// ReqPerSec caps the request rate (requests/second) per upstream host, applied independently to the
 	// upstream registry and to each of its mirrors (a per-host cap, not a shared total across hosts).
@@ -123,6 +127,11 @@ type RegistryConfig struct {
 	// Entries are validated with regclient platform.Parse (os/arch[/variant]); extra slash
 	// components beyond three are ignored by that parser, not rejected by zot.
 	Platforms []string `mapstructure:",omitempty"`
+	// Exclude lists glob patterns (same syntax as content[].prefix) of local repositories that this
+	// registry never syncs, neither periodically nor on demand, so they are served from local storage
+	// unless another registry syncs them. They are matched against the local repository name, after
+	// content[].destination and stripPrefix are applied, and win over content rules.
+	Exclude []string `mapstructure:",omitempty"`
 	// Stream serves an on-demand image to the client while it downloads, instead of after the
 	// local commit. Requires OnDemand and https URLs; incompatible with OnDemandInBackground,
 	// MaxRetries/RetryDelay and TLSVerify: false.

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,7 +15,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -21,6 +25,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/api/constants"
 	apiErr "zotregistry.dev/zot/v2/pkg/api/errors"
 	"zotregistry.dev/zot/v2/pkg/log"
+	reqCtx "zotregistry.dev/zot/v2/pkg/requestcontext"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
 
@@ -128,6 +133,94 @@ func TestBearerAuthMiddlewareDefaultsUnknownMethodsToPull(t *testing.T) {
 	if !strings.Contains(response.Header().Get("WWW-Authenticate"), "scope=\"repository:repo:pull\"") {
 		t.Fatalf("expected pull challenge, got %q", response.Header().Get("WWW-Authenticate"))
 	}
+}
+
+func TestBearerAuthChallengesInvalidTokens(t *testing.T) {
+	t.Parallel()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expiredToken, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, ClaimsWithAccess{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Minute)),
+		IssuedAt:  jwt.NewNumericDate(time.Now().Add(-time.Hour)),
+		Access:    []ResourceAccess{{Type: "repository", Name: "repo", Actions: []string{"pull", "push"}}},
+	}).SignedString(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conf := config.New()
+	conf.HTTP.Auth = &config.AuthConfig{Bearer: &config.BearerConfig{Realm: "realm", Service: "service"}}
+	ctlr := &Controller{Config: conf, Log: log.NewTestLogger()}
+	bearerAuth := &BearerAuth{
+		authConfig:   conf.HTTP.Auth,
+		bearerConfig: conf.HTTP.Auth.Bearer,
+		log:          ctlr.Log,
+		traditional: NewBearerAuthorizer("realm", "service", func(context.Context, *jwt.Token) (any, error) {
+			return publicKey, nil
+		}),
+	}
+	authn := &AuthnMiddleware{bearerAuth: bearerAuth, log: ctlr.Log}
+
+	middlewares := map[string]mux.MiddlewareFunc{
+		"bearer only":   bearerAuth.Middleware(ctlr),
+		"combined auth": authn.tryAuthnHandlers(ctlr),
+	}
+
+	for name, middleware := range middlewares {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			serve := func(authorization string) *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodPatch, "/v2/repo/blobs/uploads/session", nil)
+				request = mux.SetURLVars(request, map[string]string{"name": "repo"})
+				request.Header.Set("Authorization", authorization)
+				response := httptest.NewRecorder()
+
+				middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("expected protected handler not to be called")
+				})).ServeHTTP(response, request)
+
+				return response
+			}
+
+			response := serve("Bearer " + expiredToken)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, response.Code)
+			}
+
+			wantChallenge := `Bearer realm="realm",service="service",scope="repository:repo:push",error="invalid_token"`
+			if challenge := response.Header().Get("WWW-Authenticate"); challenge != wantChallenge {
+				t.Fatalf("expected challenge %q, got %q", wantChallenge, challenge)
+			}
+
+			if !strings.Contains(response.Body.String(), apiErr.UNAUTHORIZED.String()) {
+				t.Fatalf("expected %s error, got %s", apiErr.UNAUTHORIZED.String(), response.Body.String())
+			}
+		})
+	}
+
+	t.Run("a credential that is not a bearer token is not challenged", func(t *testing.T) {
+		t.Parallel()
+
+		request := httptest.NewRequest(http.MethodGet, "/v2/repo/manifests/latest", nil)
+		request = mux.SetURLVars(request, map[string]string{"name": "repo"})
+		request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("user:pass")))
+		response := httptest.NewRecorder()
+
+		bearerAuth.Middleware(ctlr)(http.NotFoundHandler()).ServeHTTP(response, request)
+
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, response.Code)
+		}
+
+		if challenge := response.Header().Get("WWW-Authenticate"); challenge != "" {
+			t.Fatalf("expected no challenge, got %q", challenge)
+		}
+	})
 }
 
 func TestRequestedBearerResourceActionBaseRoute(t *testing.T) {
@@ -754,6 +847,58 @@ func TestWrappedAPIKeyBearerTokenUsesReloadedAPIKeyConfig(t *testing.T) {
 	}
 }
 
+func TestWrappedAPIKeyBearerTokenMarksAPIKeyAuthentication(t *testing.T) {
+	t.Parallel()
+
+	conf := config.New()
+	conf.HTTP.Auth = &config.AuthConfig{
+		APIKey: true,
+		Bearer: &config.BearerConfig{
+			Realm:   "realm",
+			Service: "service",
+		},
+	}
+
+	ctlr := &Controller{
+		Config: conf,
+		Log:    log.NewTestLogger(),
+		MetaDB: mocks.MetaDBMock{
+			GetUserAPIKeyInfoFn: func(_ string) (string, error) {
+				return "alice", nil
+			},
+		},
+	}
+
+	token := newWrappedCredentialBearerToken("alice", constants.APIKeysPrefix+"key")
+	bearerAuth := NewBearerAuth(conf.CopyAuthConfig(), log.NewTestLogger())
+
+	called := false
+	next := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		called = true
+
+		userAc, err := reqCtx.UserAcFromContext(request.Context())
+		if err != nil {
+			t.Fatalf("failed to get user access control: %v", err)
+		}
+
+		if !userAc.IsAPIKeyAuthenticated() {
+			t.Fatal("expected wrapped api key bearer token to mark api key authentication")
+		}
+
+		response.WriteHeader(http.StatusOK)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, constants.APIKeyPath, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+
+	bearerAuth.Middleware(ctlr)(next).ServeHTTP(response, request)
+
+	if !called {
+		t.Fatalf("expected request to be authenticated, got status %d", response.Code)
+	}
+}
+
 func TestAPIKeyTokenExchangeHandlesCredentialErrors(t *testing.T) {
 	t.Parallel()
 
@@ -1261,5 +1406,133 @@ func TestOIDCBearerTokenExchangeRequiresOIDCAuthorizer(t *testing.T) {
 	bearerAuth := &BearerAuth{}
 	if bearerAuth.TokenExchangeHandler(nil) != nil {
 		t.Fatal("expected token exchange handler to be nil without OIDC authorizer")
+	}
+}
+
+func TestTokenExchangeProxyStripsBasicChallengeForUI(t *testing.T) {
+	t.Parallel()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Add("WWW-Authenticate", `Basic realm="upstream"`)
+		response.Header().Add("WWW-Authenticate", `Bearer realm="https://upstream/token"`)
+		response.WriteHeader(http.StatusUnauthorized)
+	}))
+	// Cleanup, not defer: the parallel subtests run after this function returns.
+	t.Cleanup(proxyServer.Close)
+
+	conf := config.New()
+	conf.HTTP.Auth = &config.AuthConfig{
+		APIKey: true, // the token exchange handler is only built with OIDC or API keys enabled
+		Bearer: &config.BearerConfig{
+			Realm:   "realm",
+			Service: "service",
+			UpstreamTokenEndpoint: &config.UpstreamTokenEndpointConfig{
+				Realm:             proxyServer.URL + "/token",
+				Service:           "upstream",
+				AllowInsecureHTTP: true,
+			},
+		},
+	}
+	bearerAuth := &BearerAuth{authConfig: conf.HTTP.Auth, bearerConfig: conf.HTTP.Auth.Bearer, log: log.NewTestLogger()}
+	handler := bearerAuth.TokenExchangeHandler(nil)
+	if handler == nil {
+		t.Fatal("expected token exchange handler")
+	}
+
+	tests := []struct {
+		name     string
+		headers  map[string]string
+		expected []string
+	}{
+		{
+			name:     "registry client keeps upstream challenges",
+			expected: []string{`Basic realm="upstream"`, `Bearer realm="https://upstream/token"`},
+		},
+		{
+			name:     "browser without ui header keeps upstream challenges",
+			headers:  map[string]string{"Sec-Fetch-Mode": "navigate"},
+			expected: []string{`Basic realm="upstream"`, `Bearer realm="https://upstream/token"`},
+		},
+		{
+			name:     "ui client drops basic challenge",
+			headers:  map[string]string{constants.SessionClientHeaderName: constants.SessionClientHeaderValue},
+			expected: []string{`Bearer realm="https://upstream/token"`},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			request := httptest.NewRequest(http.MethodGet, constants.TokenPath, nil)
+			for name, value := range test.headers {
+				request.Header.Set(name, value)
+			}
+
+			response := httptest.NewRecorder()
+			handler(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("expected status %d, got %d", http.StatusUnauthorized, response.Code)
+			}
+
+			got := response.Header().Values("WWW-Authenticate")
+			if strings.Join(got, "\n") != strings.Join(test.expected, "\n") {
+				t.Fatalf("expected WWW-Authenticate %q, got %q", test.expected, got)
+			}
+		})
+	}
+}
+
+func TestRemoveBasicAuthChallenges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		values   []string
+		expected []string
+	}{
+		{name: "no header", values: nil, expected: nil},
+		{name: "bearer only", values: []string{`Bearer realm="a",service="s"`},
+			expected: []string{`Bearer realm="a",service="s"`}},
+		{name: "basic only, any case", values: []string{`basic realm="b"`}, expected: nil},
+		{name: "bare basic", values: []string{`Basic`}, expected: nil},
+		{name: "basic with token68", values: []string{`Basic dXNlcjpwYXNz==`}, expected: nil},
+		{name: "separate values", values: []string{`Bearer realm="a"`, `Basic realm="b"`},
+			expected: []string{`Bearer realm="a"`}},
+		// Bearer must survive when it shares a field value with Basic, in either order.
+		{name: "bearer then basic in one value",
+			values:   []string{`Bearer realm="https://upstream/token", service="u", Basic realm="upstream"`},
+			expected: []string{`Bearer realm="https://upstream/token", service="u"`}},
+		{name: "basic then bearer in one value",
+			values:   []string{`Basic realm="upstream", charset="UTF-8", Bearer realm="https://upstream/token"`},
+			expected: []string{`Bearer realm="https://upstream/token"`}},
+		// Commas and "Basic" inside quoted-strings are parameter data, not challenge boundaries.
+		{name: "quoted param containing , Basic", values: []string{`Bearer realm="x, Basic y", service="s"`},
+			expected: []string{`Bearer realm="x, Basic y", service="s"`}},
+		{name: "escaped quote inside quoted param", values: []string{`Bearer error_description="a \", Basic b", scope="c"`},
+			expected: []string{`Bearer error_description="a \", Basic b", scope="c"`}},
+		{name: "param value starting with basic", values: []string{`Bearer realm="basically"`},
+			expected: []string{`Bearer realm="basically"`}},
+		{name: "other schemes kept", values: []string{`Negotiate, Basic realm="b", Digest realm="d", nonce="n"`},
+			expected: []string{`Negotiate, Digest realm="d", nonce="n"`}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			header := http.Header{}
+			for _, value := range test.values {
+				header.Add("WWW-Authenticate", value)
+			}
+
+			removeBasicAuthChallenges(header)
+
+			got := header.Values("WWW-Authenticate")
+			if strings.Join(got, "\n") != strings.Join(test.expected, "\n") {
+				t.Fatalf("expected %q, got %q", test.expected, got)
+			}
+		})
 	}
 }

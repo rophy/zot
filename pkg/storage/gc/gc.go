@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	godigest "github.com/opencontainers/go-digest"
@@ -17,6 +19,7 @@ import (
 
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
+	"zotregistry.dev/zot/v2/pkg/cluster"
 	zcommon "zotregistry.dev/zot/v2/pkg/common"
 	"zotregistry.dev/zot/v2/pkg/compat"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
@@ -56,12 +59,19 @@ type Options struct {
 	// StagingRoot is the local filesystem root whose <repo>/.sync/<uuid> trees block
 	// idle-repository removal during GC for this image store. Populated by RunGCTasks.
 	StagingRoot string
+
+	// Cluster is the scale-out configuration. When set, a periodic GC sweep only runs on
+	// the repositories the local member owns by the cluster hash, the same member that
+	// serves and writes them, so members sharing storage don't collect a repository at
+	// the same time. Populated by RunGCTasks.
+	Cluster *config.ClusterConfig
 }
 
 type GarbageCollect struct {
 	imgStore  types.ImageStore
 	opts      Options
 	metaDB    mTypes.MetaDB
+	metaPlan  *gcMetaDBPlan
 	policyMgr rTypes.PolicyManager
 	auditLog  *zlog.Logger
 	log       zlog.Logger
@@ -71,6 +81,42 @@ type GarbageCollect struct {
 	// Passes over one repository never overlap (the repository is locked), and
 	// the map is shared by the value-receiver copies of this struct.
 	memos *sync.Map
+}
+
+// gcMetaDBPlan delays metadata changes until the pruned index has been committed.
+// The plan is scoped to one cleanRepoLocked call and is intentionally not part of
+// the MetaDB interface: it protects the storage/index commit boundary without
+// changing MetaDB implementations.
+type gcMetaDBPlan struct {
+	operations []func() error
+}
+
+func (gc GarbageCollect) runOrDeferMetaDBOperation(operation func() error) error {
+	if gc.metaPlan == nil {
+		return operation()
+	}
+
+	gc.metaPlan.operations = append(gc.metaPlan.operations, operation)
+
+	return nil
+}
+
+func (gc GarbageCollect) commitMetaDBPlan() error {
+	if gc.metaPlan == nil {
+		return nil
+	}
+
+	for _, operation := range gc.metaPlan.operations {
+		if err := operation(); err != nil {
+			gc.metaPlan.operations = nil
+
+			return err
+		}
+	}
+
+	gc.metaPlan.operations = nil
+
+	return nil
 }
 
 func NewGarbageCollect(imgStore types.ImageStore, metaDB mTypes.MetaDB, opts Options,
@@ -92,7 +138,9 @@ func NewGarbageCollect(imgStore types.ImageStore, metaDB mTypes.MetaDB, opts Opt
 CleanImageStorePeriodically runs a periodic garbage collect on the ImageStore provided in constructor,
 given an interval and a Scheduler.
 */
-func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch *scheduler.Scheduler) {
+// CleanImageStorePeriodically submits a periodic GC sweep of the image store to the scheduler,
+// and returns an OnDemand for running GC before the next periodic sweep is due.
+func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch *scheduler.Scheduler) *OnDemand {
 	processedRepos := make(map[string]struct{})
 
 	maxDelay := gc.opts.MaxSchedulerDelay
@@ -109,6 +157,8 @@ func (gc GarbageCollect) CleanImageStorePeriodically(interval time.Duration, sch
 	}
 
 	sch.SubmitGenerator(generator, interval, scheduler.MediumPriority)
+
+	return newOnDemand(gc, sch, generator)
 }
 
 /*
@@ -196,6 +246,10 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 		defer gc.memos.Delete(repo)
 	}
 
+	if gc.metaDB != nil && !gc.opts.ImageRetention.DryRun {
+		gc.metaPlan = &gcMetaDBPlan{}
+	}
+
 	/* this index (which represents the index.json of this repo) is the root point from which we
 	search for dangling manifests/blobs
 	so this index is passed by reference in all functions that modifies it
@@ -214,6 +268,8 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 
 		return err
 	}
+
+	indexBefore := cloneGCIndex(index)
 
 	// One root Prefetch for the pass so referrer, untagged-identify, stale, and
 	// referenced-blob walks do not each pay serial GetIndex/GetManifest on
@@ -274,6 +330,21 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 		// Update index.json with manifest references removed above; orphan
 		// manifest/config/layer blobs are deleted by gc.deleteUnreferencedBlobs().
 		if err := gc.imgStore.PutIndexContent(repo, index); err != nil {
+			if rollbackErr := gc.imgStore.PutIndexContent(repo, indexBefore); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("failed to restore index after index commit failure: %w", rollbackErr))
+			}
+
+			return err
+		}
+
+		// MetaDB changes are committed only after the index update succeeds. If the
+		// staged index write fails, the plan is discarded with this pass and the old
+		// index and metadata remain aligned for a later retry.
+		if err := gc.commitMetaDBPlan(); err != nil {
+			if rollbackErr := gc.imgStore.PutIndexContent(repo, indexBefore); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("failed to restore index after MetaDB commit failure: %w", rollbackErr))
+			}
+
 			return err
 		}
 
@@ -319,6 +390,22 @@ func (gc GarbageCollect) cleanRepoLocked(ctx context.Context, repo string) error
 	}
 
 	return nil
+}
+
+func cloneGCIndex(index ispec.Index) ispec.Index {
+	cloned := index
+	cloned.Manifests = make([]ispec.Descriptor, len(index.Manifests))
+
+	for i, desc := range index.Manifests {
+		cloned.Manifests[i] = desc
+		if desc.Annotations == nil {
+			continue
+		}
+
+		cloned.Manifests[i].Annotations = maps.Clone(desc.Annotations)
+	}
+
+	return cloned
 }
 
 // removeUnknownMediaTypeManifestEntries prunes index.Manifests descriptors whose media type is not a
@@ -475,11 +562,16 @@ func (gc GarbageCollect) clearStatisticsForPrunedDigests(repo string, original, 
 
 		seen[desc.Digest] = struct{}{}
 
-		if err := gc.metaDB.RemoveRepoReference(repo, desc.Digest.String(), desc.Digest); err != nil {
-			gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
-				Str("repository", repo).Str("digest", desc.Digest.String()).
-				Msg("failed to drop statistics for a pruned manifest, continuing")
-		}
+		digest := desc.Digest
+		_ = gc.runOrDeferMetaDBOperation(func() error {
+			if err := gc.metaDB.RemoveRepoReference(repo, digest.String(), digest); err != nil {
+				gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+					Str("repository", repo).Str("digest", digest.String()).
+					Msg("failed to drop statistics for a pruned manifest, continuing")
+			}
+
+			return nil
+		})
 	}
 }
 
@@ -500,11 +592,12 @@ func tagReferenceKeepsStatistics(desc ispec.Descriptor) bool {
 	return true
 }
 
-// syncManifestRemoval best-effort syncs metaDB before a descriptor is removed from index.Manifests
-// (index.json is persisted later in cleanRepo). metaDB failures are logged but do not abort pruning —
-// storage repair must not depend on secondary index consistency. The blob is typically already absent
-// from storage; cosign signatures are cleaned up via tag annotation. reason/message identify which
-// prune path (stale vs. unknown media type) triggered the removal, for log/audit consumers.
+// syncManifestRemoval best-effort syncs metaDB before a descriptor is removed from index.Manifests.
+// During cleanRepo the operation is deferred until index.json is committed; direct callers execute it
+// immediately. metaDB failures are logged but do not abort pruning — storage repair must not depend on
+// secondary index consistency. The blob is typically already absent from storage; cosign signatures are
+// cleaned up via tag annotation. reason/message identify which prune path (stale vs. unknown media type)
+// triggered the removal, for log/audit consumers.
 func (gc GarbageCollect) syncManifestRemoval(repo string, desc ispec.Descriptor, reason, message string) error {
 	tag, hasTag := getDescriptorTag(desc)
 	ref := tag
@@ -527,22 +620,11 @@ func (gc GarbageCollect) syncManifestRemoval(repo string, desc ispec.Descriptor,
 		}
 	}
 
-	if gc.metaDB != nil {
-		if isCosignSig {
-			if err := gc.metaDB.DeleteSignature(repo, subjectDigest, mTypes.SignatureMetadata{
-				SignatureDigest: desc.Digest.String(),
-				SignatureType:   storage.CosignType,
-			}); err != nil {
-				gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
-					Str("repository", repo).Str("digest", desc.Digest.String()).Str("reference", ref).
-					Msg("failed to remove stale cosign signature from metaDB, continuing stale prune")
-			}
-		} else if err := gc.metaDB.RemoveRepoReference(repo, ref, desc.Digest); err != nil {
-			gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
-				Str("repository", repo).Str("digest", desc.Digest.String()).Str("reference", ref).
-				Msg("failed to remove stale manifest reference from metaDB, continuing stale prune")
-		}
-	}
+	_ = gc.runOrDeferMetaDBOperation(func() error {
+		gc.syncManifestRemovalMeta(repo, ref, desc, isCosignSig, subjectDigest)
+
+		return nil
+	})
 
 	logEvent := gc.log.Info().Str("module", "gc").
 		Str("repository", repo).
@@ -573,6 +655,29 @@ func (gc GarbageCollect) syncManifestRemoval(repo string, desc ispec.Descriptor,
 	}
 
 	return nil
+}
+
+func (gc GarbageCollect) syncManifestRemovalMeta(repo, ref string, desc ispec.Descriptor,
+	isCosignSig bool, subjectDigest godigest.Digest,
+) {
+	if gc.metaDB == nil {
+		return
+	}
+
+	if isCosignSig {
+		if err := gc.metaDB.DeleteSignature(repo, subjectDigest, mTypes.SignatureMetadata{
+			SignatureDigest: desc.Digest.String(),
+			SignatureType:   storage.CosignType,
+		}); err != nil {
+			gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+				Str("repository", repo).Str("digest", desc.Digest.String()).Str("reference", ref).
+				Msg("failed to remove stale cosign signature from metaDB, continuing stale prune")
+		}
+	} else if err := gc.metaDB.RemoveRepoReference(repo, ref, desc.Digest); err != nil {
+		gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+			Str("repository", repo).Str("digest", desc.Digest.String()).Str("reference", ref).
+			Msg("failed to remove stale manifest reference from metaDB, continuing stale prune")
+	}
 }
 
 // confirmBlobMissing reports whether StatBlob shows the blob is gone. A successful
@@ -1000,8 +1105,9 @@ func (gc GarbageCollect) removeManifestIfOlderThan(repo string, index *ispec.Ind
 	return gced, nil
 }
 
-// removeManifest removes a manifest reference from an index and syncs metaDB. It does not delete
-// the blob from storage (orphan blobs are deleted later by deleteUnreferencedBlobs).
+// removeManifest removes a manifest reference from an index and schedules its metaDB sync. During
+// cleanRepo the sync is deferred until index.json is committed. It does not delete the blob from
+// storage (orphan blobs are deleted later by deleteUnreferencedBlobs).
 func (gc GarbageCollect) removeManifest(repo string, index *ispec.Index,
 	desc ispec.Descriptor, reference string, signatureType string, subjectDigest godigest.Digest,
 ) (bool, error) {
@@ -1018,39 +1124,55 @@ func (gc GarbageCollect) removeManifest(repo string, index *ispec.Index,
 		return true, nil
 	}
 
-	// sync metaDB
-	if gc.metaDB != nil {
-		if signatureType != "" {
-			err = gc.metaDB.DeleteSignature(repo, subjectDigest, mTypes.SignatureMetadata{
-				SignatureDigest: desc.Digest.String(),
-				SignatureType:   signatureType,
-			})
-			switch {
-			case errors.Is(err, zerr.ErrImageMetaNotFound), errors.Is(err, zerr.ErrRepoMetaNotFound):
-				// Expected when signature metadata is already gone: RemoveRepoReference
-				// deleted Signatures[subject], or the repository record itself is absent
-				// (e.g. untagged subject GC after last-tag overwrite left the digest in
-				// index.json, then a later referrer pass removes the signature).
-				gc.log.Debug().Err(err).Str("module", "gc").Str("component", "metadb").
-					Msg("signature meta already removed")
-			case err != nil:
-				gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
-					Msg("failed to remove signature in metaDB")
-
-				return false, err
-			}
-		} else {
-			err := gc.metaDB.RemoveRepoReference(repo, reference, desc.Digest)
-			if err != nil {
-				gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
-					Msg("failed to remove repo reference in metaDB")
-
-				return false, err
-			}
-		}
+	if err := gc.runOrDeferMetaDBOperation(func() error {
+		return gc.removeManifestMeta(repo, desc, reference, signatureType, subjectDigest)
+	}); err != nil {
+		return false, err
 	}
 
 	return true, nil
+}
+
+func (gc GarbageCollect) removeManifestMeta(repo string, desc ispec.Descriptor, reference string,
+	signatureType string, subjectDigest godigest.Digest,
+) error {
+	if gc.metaDB == nil {
+		return nil
+	}
+
+	if signatureType != "" {
+		err := gc.metaDB.DeleteSignature(repo, subjectDigest, mTypes.SignatureMetadata{
+			SignatureDigest: desc.Digest.String(),
+			SignatureType:   signatureType,
+		})
+		switch {
+		case errors.Is(err, zerr.ErrImageMetaNotFound), errors.Is(err, zerr.ErrRepoMetaNotFound):
+			// Expected when signature metadata is already gone: RemoveRepoReference
+			// deleted Signatures[subject], or the repository record itself is absent
+			// (e.g. untagged subject GC after last-tag overwrite left the digest in
+			// index.json, then a later referrer pass removes the signature).
+			gc.log.Debug().Err(err).Str("module", "gc").Str("component", "metadb").
+				Msg("signature meta already removed")
+
+			return nil
+		case err != nil:
+			gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+				Msg("failed to remove signature in metaDB")
+
+			return err
+		default:
+			return nil
+		}
+	}
+
+	if err := gc.metaDB.RemoveRepoReference(repo, reference, desc.Digest); err != nil {
+		gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
+			Msg("failed to remove repo reference in metaDB")
+
+		return err
+	}
+
+	return nil
 }
 
 func (gc GarbageCollect) removeUntaggedManifests(ctx context.Context, repo string, index *ispec.Index,
@@ -1406,6 +1528,15 @@ type GCTaskGenerator struct {
 	maxDelay          time.Duration
 	timeWindow        config.GCTimeWindow
 	loggedWindowDefer bool
+	// nextRepo and nextRepoErr are the result of looking up the repository to hand out next,
+	// if nextRepoKnown, looked up with the previous one.
+	nextRepo      string
+	nextRepoErr   error
+	nextRepoKnown bool
+	// sweep tracks the status of the current or last sweep.
+	sweep sweepState
+	// forceSweep lets the next sweep start outside the time window, when requested on demand.
+	forceSweep atomic.Bool
 }
 
 func (gen *GCTaskGenerator) getRandomDelay() time.Duration {
@@ -1433,20 +1564,93 @@ func (gen *GCTaskGenerator) Next() (scheduler.Task, error) {
 
 	gen.nextRun = time.Now().Add(delay)
 
-	repo, err := gen.imgStore.GetNextRepository(gen.processedRepos)
+	// the lookup below marks repositories of other members as processed, so check this first
+	startingSweep := len(gen.processedRepos) == 0
+
+	repo, err := gen.nextRepo, gen.nextRepoErr
+	if !gen.nextRepoKnown {
+		repo, err = gen.getNextOwnedRepository()
+	}
+
+	gen.nextRepoKnown = false
+
+	if startingSweep {
+		gen.sweep.start()
+	}
+
 	if err != nil {
+		// the scheduler retries the generator later, so the sweep keeps running
+		gen.sweep.setError(err)
+
 		return nil, err
 	}
 
 	if repo == "" {
 		gen.done = true
+		// a request which raced with this sweep's start is covered by this sweep
+		gen.forceSweep.Store(false)
+		gen.sweep.generationDone()
 
 		return nil, nil //nolint:nilnil
 	}
 
 	gen.processedRepos[repo] = struct{}{}
 
-	return NewGCTask(gen.imgStore, gen.gc, repo), nil
+	// Look up the next repository now, so that after the last one the call which ends the sweep
+	// doesn't wait for the delay. The next call returns the result, error included.
+	gen.nextRepo, gen.nextRepoErr = gen.getNextOwnedRepository()
+	gen.nextRepoKnown = true
+
+	if gen.nextRepo == "" && gen.nextRepoErr == nil {
+		gen.nextRun = time.Now()
+	}
+
+	gen.sweep.taskStarted()
+
+	task := NewGCTask(gen.imgStore, gen.gc, repo)
+	task.onDone = gen.sweep.taskDone
+
+	return task, nil
+}
+
+// getNextOwnedRepository returns the next repository the local member owns by the cluster hash,
+// or an empty name when there is none left. Repositories owned by other members are marked
+// as processed, so the sweep still ends once every repository has been seen.
+func (gen *GCTaskGenerator) getNextOwnedRepository() (string, error) {
+	for {
+		repo, err := gen.imgStore.GetNextRepository(gen.processedRepos)
+		if err != nil || repo == "" {
+			return repo, err
+		}
+
+		if gen.gc.isRepoOwnedLocally(repo) {
+			return repo, nil
+		}
+
+		gen.processedRepos[repo] = struct{}{}
+	}
+}
+
+// isRepoOwnedLocally reports whether the local member owns repo by the cluster hash.
+// Outside of a scale-out cluster every repository is owned locally.
+func (gc GarbageCollect) isRepoOwnedLocally(repo string) bool {
+	clusterConfig := gc.opts.Cluster
+
+	// Proxy holds the local member's index; it is only set up by a running controller.
+	if !clusterConfig.IsClustered() || clusterConfig.Proxy == nil {
+		return true
+	}
+
+	targetIdx, targetMember := cluster.ComputeTargetMember(clusterConfig.HashKey, clusterConfig.Members, repo)
+	if targetIdx == clusterConfig.Proxy.LocalMemberClusterSocketIndex {
+		return true
+	}
+
+	gc.log.Debug().Str("module", "gc").Str("repository", repo).
+		Str("targetMemberIndex", strconv.FormatUint(targetIdx, 10)).Str("targetMember", targetMember).
+		Msg("skipping gc of repo not managed by local instance")
+
+	return false
 }
 
 func (gen *GCTaskGenerator) IsDone() bool {
@@ -1466,7 +1670,13 @@ func (gen *GCTaskGenerator) IsReady() bool {
 	// window reopens the next day.
 	startingNewSweep := len(gen.processedRepos) == 0 && gen.nextRun.IsZero()
 
-	if startingNewSweep && !gen.timeWindow.Contains(now) {
+	// Don't start a new sweep while tasks of the last one are still queued or running, so that
+	// the status reports when each sweep finishes.
+	if startingNewSweep && gen.sweep.hasPendingTasks() {
+		return false
+	}
+
+	if startingNewSweep && !gen.forceSweep.Load() && !gen.timeWindow.Contains(now) {
 		if !gen.loggedWindowDefer {
 			if gen.gc.log.Logger != nil {
 				gen.gc.log.Debug().Msg("gc sweep deferred, outside gcTimeWindow")
@@ -1487,22 +1697,31 @@ func (gen *GCTaskGenerator) Reset() {
 	gen.processedRepos = make(map[string]struct{})
 	gen.done = false
 	gen.nextRun = time.Time{}
+	gen.nextRepo, gen.nextRepoErr, gen.nextRepoKnown = "", nil, false
 }
 
 type gcTask struct {
 	imgStore types.ImageStore
 	gc       GarbageCollect
 	repo     string
+	// onDone, if set, is called with the result once the task has run.
+	onDone func(err error)
 }
 
 func NewGCTask(imgStore types.ImageStore, gc GarbageCollect, repo string,
 ) *gcTask {
-	return &gcTask{imgStore, gc, repo}
+	return &gcTask{imgStore: imgStore, gc: gc, repo: repo}
 }
 
 func (gct *gcTask) DoWork(ctx context.Context) error {
 	// run task
-	return gct.gc.CleanRepo(ctx, gct.repo) //nolint: contextcheck
+	err := gct.gc.CleanRepo(ctx, gct.repo) //nolint: contextcheck
+
+	if gct.onDone != nil {
+		gct.onDone(err)
+	}
+
+	return err
 }
 
 func (gct *gcTask) String() string {

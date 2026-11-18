@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
@@ -15,6 +17,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/api/constants"
 	"zotregistry.dev/zot/v2/pkg/log"
+	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	reqCtx "zotregistry.dev/zot/v2/pkg/requestcontext"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
@@ -410,6 +413,58 @@ func TestAuthenticateAPIKeyCredentialRequiresMetaDB(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestAuthenticateAPIKeyCredentialMaxLifetime(t *testing.T) {
+	t.Parallel()
+
+	authenticate := func(t *testing.T, metaDB *mocks.MetaDBMock) (bool, error) {
+		t.Helper()
+
+		conf := config.New()
+		conf.HTTP.Auth = &config.AuthConfig{APIKey: true, APIKeyMaxLifetime: time.Hour}
+
+		metaDB.GetUserAPIKeyInfoFn = func(string) (string, error) { return "alice", nil }
+		metaDB.UpdateUserAPIKeyLastUsedFn = func(context.Context, string) error {
+			t.Error("a refused key must not be marked as used")
+
+			return nil
+		}
+
+		return authenticateAPIKeyCredential(
+			&Controller{Config: conf, MetaDB: metaDB, Log: log.NewTestLogger()},
+			reqCtx.NewUserAccessControl(),
+			httptest.NewRequest(http.MethodGet, "/v2/", nil),
+			"alice",
+			constants.APIKeysPrefix+"key",
+		)
+	}
+
+	t.Run("user data read fails", func(t *testing.T) {
+		t.Parallel()
+
+		errUserData := errors.New("user data")
+
+		authenticated, err := authenticate(t, &mocks.MetaDBMock{
+			GetUserDataFn: func(context.Context) (mTypes.UserData, error) {
+				return mTypes.UserData{}, errUserData
+			},
+		})
+		assert.False(t, authenticated)
+		assert.ErrorIs(t, err, errUserData)
+	})
+
+	t.Run("key missing from user data is refused", func(t *testing.T) {
+		t.Parallel()
+
+		authenticated, err := authenticate(t, &mocks.MetaDBMock{
+			GetUserDataFn: func(context.Context) (mTypes.UserData, error) {
+				return mTypes.UserData{}, nil
+			},
+		})
+		assert.False(t, authenticated)
+		assert.NoError(t, err)
+	})
+}
+
 func TestHashUUIDPreservesStableAPIKeyLookupDigest(t *testing.T) {
 	t.Parallel()
 
@@ -693,6 +748,72 @@ func TestAuthChallengeHelpers(t *testing.T) {
 	response = httptest.NewRecorder()
 	setBasicAuthChallenge(response, "zot")
 	assert.Equal(t, `Basic realm="zot"`, response.Header().Get("WWW-Authenticate"))
+}
+
+func TestBrowserBasicAuthChallenges(t *testing.T) {
+	t.Parallel()
+
+	// Only the zot UI skips the Basic challenge. Other browser pages (GraphQL playground,
+	// Swagger UI, a bookmarked /v2/ URL) do not send the UI header, so the native prompt is
+	// their only way to authenticate and must keep working.
+	tests := []struct {
+		name      string
+		headers   map[string]string
+		challenge bool
+	}{
+		{name: "registry client", challenge: true},
+		{name: "docker client", headers: map[string]string{"User-Agent": "Docker-Client/28.0"}, challenge: true},
+		{name: "wildcard accept", headers: map[string]string{"Accept": "*/*"}, challenge: true},
+		{name: "json accept", headers: map[string]string{"Accept": "application/json"}, challenge: true},
+		{name: "ui client", headers: map[string]string{
+			constants.SessionClientHeaderName: constants.SessionClientHeaderValue,
+		}},
+		{name: "browser navigation", headers: map[string]string{"Sec-Fetch-Mode": "navigate"}, challenge: true},
+		{name: "browser fetch without ui header", headers: map[string]string{"Sec-Fetch-Mode": "cors"}, challenge: true},
+		{name: "browser without fetch metadata", headers: map[string]string{
+			"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		}, challenge: true},
+		{name: "other api client header", headers: map[string]string{
+			constants.SessionClientHeaderName: "not-zot-ui", "Sec-Fetch-Mode": "navigate",
+		}, challenge: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			conf := config.New()
+			conf.HTTP.Auth = &config.AuthConfig{HTPasswd: config.AuthHTPasswd{Path: "/tmp/htpasswd"}}
+			conf.HTTP.Realm = "zot"
+
+			request := httptest.NewRequest(http.MethodGet, "/v2/", nil)
+			for name, value := range test.headers {
+				request.Header.Set(name, value)
+			}
+
+			failure := httptest.NewRecorder()
+			authFail(failure, request, "zot", 0)
+			assert.Equal(t, http.StatusUnauthorized, failure.Code)
+			assert.Equal(t, "application/json", failure.Header().Get("Content-Type"))
+
+			// /v2/ answers 200 but still advertises a challenge, so it needs the same gating
+			version := httptest.NewRecorder()
+			(&RouteHandler{c: &Controller{Config: conf}}).CheckVersionSupport(version, request)
+			assert.Equal(t, http.StatusOK, version.Code)
+
+			token := httptest.NewRecorder()
+			oidcTokenExchangeUnauthorized(token, request, conf.HTTP.Auth)
+			assert.Equal(t, http.StatusUnauthorized, token.Code)
+
+			for _, response := range []*httptest.ResponseRecorder{failure, version, token} {
+				if test.challenge {
+					assert.Equal(t, `Basic realm="zot"`, response.Header().Get("WWW-Authenticate"))
+				} else {
+					assert.Empty(t, response.Header().Get("WWW-Authenticate"))
+				}
+			}
+		})
+	}
 }
 
 func TestCheckVersionSupportChallengeHeaders(t *testing.T) {
